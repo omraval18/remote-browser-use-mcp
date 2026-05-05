@@ -54,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     browser_smoke.add_argument("--headless", action="store_true", help="Run Chrome headless.")
     browser_smoke.set_defaults(func=cmd_browser_smoke)
 
+    tui = sub.add_parser("tui", help="Start the simple terminal UI.")
+    tui.add_argument("--provider", choices=["fake", "openai"], default="fake")
+    tui.add_argument("--model", default=None)
+    tui.set_defaults(func=cmd_tui)
+
     return parser
 
 
@@ -117,6 +122,20 @@ def cmd_browser_smoke(args: argparse.Namespace) -> int:
     finally:
         runtime.close()
     return 0
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
+    from llm_browser.tui import SimpleTui
+
+    def provider_factory():
+        if args.provider == "openai":
+            from llm_browser.provider.openai_responses import OpenAIResponsesProvider
+
+            return OpenAIResponsesProvider(model=args.model)
+        return None
+
+    store = store_from_args(args)
+    return SimpleTui(store, provider_factory=provider_factory).run()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

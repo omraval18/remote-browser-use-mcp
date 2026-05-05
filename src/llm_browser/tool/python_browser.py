@@ -6,13 +6,15 @@ import json
 import os
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from llm_browser.browser import BrowserRuntime
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolImage, ToolResult
 
-RuntimeFactory = Callable[[Path, bool], BrowserRuntime]
+if TYPE_CHECKING:
+    from llm_browser.browser import BrowserRuntime
+
+RuntimeFactory = Callable[[Path, bool], "BrowserRuntime"]
 
 
 class PythonBrowserTool:
@@ -116,7 +118,7 @@ class PythonBrowserTool:
         )
         return namespace
 
-    def _runtime(self, ctx: ToolContext, headless: bool) -> BrowserRuntime:
+    def _runtime(self, ctx: ToolContext, headless: bool) -> "BrowserRuntime":
         runtime = self._runtimes.get(ctx.session.id)
         if runtime is not None:
             return runtime
@@ -125,7 +127,9 @@ class PythonBrowserTool:
         self._runtimes[ctx.session.id] = runtime
         return runtime
 
-    def _default_runtime_factory(self, root_dir: Path, headless: bool) -> BrowserRuntime:
+    def _default_runtime_factory(self, root_dir: Path, headless: bool) -> "BrowserRuntime":
+        from llm_browser.browser import BrowserRuntime
+
         return BrowserRuntime.start(root_dir=root_dir, headless=headless)
 
     def _execute(self, code: str, namespace: Dict[str, Any]) -> Any:
