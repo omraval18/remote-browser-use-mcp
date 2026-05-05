@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict, Iterable, List, Optional, Set
+
+import requests
+
+from llm_browser.provider.types import ModelEvent, ToolCall
+
+
+class OpenAIResponsesProvider:
+    """Small OpenAI Responses provider.
+
+    This intentionally keeps transport state here rather than in the agent loop.
+    The agent only knows about model deltas and tool calls.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout_s: float = 120.0,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        self.model = model or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.2"
+        self.base_url = (base_url or os.environ.get("LLM_BROWSER_OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip(
+            "/"
+        )
+        self.timeout_s = timeout_s
+        self.previous_response_id: Optional[str] = None
+        self._sent_tool_call_ids: Set[str] = set()
+
+    def start_turn(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> Iterable[ModelEvent]:
+        if not self.api_key:
+            raise RuntimeError("OpenAI API key missing. Set LLM_BROWSER_OPENAI_API_KEY or OPENAI_API_KEY.")
+
+        payload = self._build_payload(messages, tools)
+        response = requests.post(
+            f"{self.base_url}/responses",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout_s,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"OpenAI Responses request failed: HTTP {response.status_code}: {response.text[:1000]}")
+
+        data = response.json()
+        self.previous_response_id = data.get("id") or self.previous_response_id
+        for input_item in payload["input"]:
+            if input_item.get("type") == "function_call_output":
+                self._sent_tool_call_ids.add(str(input_item["call_id"]))
+
+        for item in data.get("output") or []:
+            item_type = item.get("type")
+            if item_type == "message":
+                yield from self._events_from_message(item)
+            elif item_type == "function_call":
+                yield self._event_from_function_call(item)
+            elif item_type in {"reasoning", "web_search_call"}:
+                continue
+            else:
+                text = self._extract_text_from_unknown_item(item)
+                if text:
+                    yield ModelEvent.text(text)
+
+    def _build_payload(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        input_items: List[Dict[str, Any]] = []
+
+        unsent_tool_messages = [
+            message
+            for message in messages
+            if message.get("role") == "tool" and str(message.get("tool_call_id")) not in self._sent_tool_call_ids
+        ]
+        if self.previous_response_id and unsent_tool_messages:
+            for message in unsent_tool_messages:
+                call_id = str(message["tool_call_id"])
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": message.get("content", ""),
+                    }
+                )
+        else:
+            user_text = self._latest_user_text(messages)
+            input_items.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_text}],
+                }
+            )
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": input_items,
+            "store": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["parallel_tool_calls"] = True
+        if self.previous_response_id:
+            payload["previous_response_id"] = self.previous_response_id
+        return payload
+
+    def _latest_user_text(self, messages: List[Dict[str, Any]]) -> str:
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return str(message.get("content", ""))
+        return ""
+
+    def _events_from_message(self, item: Dict[str, Any]) -> Iterable[ModelEvent]:
+        for content in item.get("content") or []:
+            content_type = content.get("type")
+            if content_type in {"output_text", "text"}:
+                text = content.get("text")
+                if text:
+                    yield ModelEvent.text(str(text))
+
+    def _event_from_function_call(self, item: Dict[str, Any]) -> ModelEvent:
+        raw_arguments = item.get("arguments") or "{}"
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            arguments = {"_raw": str(raw_arguments)}
+
+        call_id = item.get("call_id") or item.get("id")
+        if not call_id:
+            raise RuntimeError(f"function_call item is missing call_id: {item}")
+
+        return ModelEvent.call(
+            ToolCall(
+                id=str(call_id),
+                name=str(item["name"]),
+                arguments=arguments,
+            )
+        )
+
+    def _extract_text_from_unknown_item(self, item: Dict[str, Any]) -> str:
+        text = item.get("text")
+        if isinstance(text, str):
+            return text
+        return ""

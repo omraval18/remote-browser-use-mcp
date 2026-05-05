@@ -28,10 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--parent-id", default=None, help="Optional parent session id.")
     run.add_argument(
         "--provider",
-        choices=["fake"],
+        choices=["fake", "openai"],
         default="fake",
-        help="Provider to use. Only fake is implemented so far.",
+        help="Provider to use.",
     )
+    run.add_argument("--model", default=None, help="Model name for provider=openai.")
     run.set_defaults(func=cmd_run)
 
     sessions = sub.add_parser("sessions", help="Inspect sessions.")
@@ -60,7 +61,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     store = store_from_args(args)
-    agent = Agent(store)
+    provider = None
+    if args.provider == "openai":
+        from llm_browser.provider.openai_responses import OpenAIResponsesProvider
+
+        provider = OpenAIResponsesProvider(model=args.model)
+    agent = Agent(store, provider=provider)
     session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
