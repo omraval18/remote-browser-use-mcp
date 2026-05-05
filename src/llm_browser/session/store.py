@@ -14,9 +14,9 @@ from llm_browser.session.metadata import SessionMetadata
 
 class SessionStore:
     def __init__(self, state_dir: Path, bus: Optional[EventBus] = None) -> None:
-        self.state_dir = state_dir
+        self.state_dir = state_dir.expanduser().resolve()
         self.sessions_dir = self.state_dir / "sessions"
-        self.events = EventStore(state_dir)
+        self.events = EventStore(self.state_dir)
         self.bus = bus or EventBus()
 
     def create(self, parent_id: Optional[str] = None, cwd: Optional[Path] = None) -> SessionMetadata:

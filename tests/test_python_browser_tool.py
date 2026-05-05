@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -111,6 +112,27 @@ class PythonBrowserToolTest(unittest.TestCase):
             image_events = [event for event in store.events.read(session.id) if event.type == "tool.image"]
             self.assertEqual(len(image_events), 1)
             self.assertEqual(image_events[0].payload["image"]["label"], "loaded")
+
+    def test_relative_state_dir_is_not_affected_by_python_cwd(self) -> None:
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            work = Path(tmp) / "work"
+            work.mkdir()
+            os.chdir(root)
+            try:
+                store = SessionStore(Path("state"))
+                session = store.create(cwd=work)
+                ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+                tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+                tool(ctx, {"headless": True, "code": "screenshot('cwd_check', attach=True)"})
+
+                self.assertTrue((root / "state" / "sessions" / session.id / "events.jsonl").exists())
+                self.assertFalse((work / "state").exists())
+            finally:
+                os.chdir(previous)
 
 
 if __name__ == "__main__":
