@@ -1,6 +1,6 @@
 # Browser Agent Harness Learnings and Ideas
 
-This document is the high-level design memo. The implementation plan is in `docs/browser-agent-harness-plan.md`.
+This document is the high-level design memo. The implementation plan is in `docs/browser-agent-harness-plan.md`, and the MVP-vs-later execution split is in `docs/implementation-roadmap.md`.
 
 ## Core Thesis
 

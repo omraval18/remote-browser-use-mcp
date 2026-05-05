@@ -1,6 +1,6 @@
 # Browser Agent Harness Implementation Plan
 
-Status: design draft for iteration.
+Status: design draft for iteration. The implementation split is tracked in `docs/implementation-roadmap.md`.
 
 This plan is for a new browser-specific LLM harness built from scratch in this repo. The harness should preserve the useful substrate ideas from the existing browser harness, BU agent package, opencode, pi-mono, Codex, Hermes, and OpenClaw, while removing the coding-agent baggage that slows down browser work.
 
