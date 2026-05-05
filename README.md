@@ -1,4 +1,4 @@
-# llm-browser
+# browser use terminal
 
 A browser-specific LLM harness built around raw Chrome DevTools Protocol access, durable sessions, editable helpers, and screenshot timelines.
 
@@ -20,20 +20,20 @@ Current status: vertical MVP implementation is underway. The current runtime alr
 ## Local Commands
 
 ```bash
-uv run llm-browser doctor
-uv run llm-browser auth status
-uv run llm-browser run --provider fake "Open example.com"
-uv run llm-browser run --provider codex --model gpt-5.5 "Call the done tool with result ok."
-uv run llm-browser browser smoke --headless --url https://example.com
-uv run llm-browser tui
-uv run llm-browser sessions list
+uv run browser-use-terminal doctor
+uv run browser-use-terminal auth status
+uv run browser-use-terminal run --provider fake "Open example.com"
+uv run browser-use-terminal run --provider codex --model gpt-5.5 "Call the done tool with result ok."
+uv run browser-use-terminal browser smoke --headless --url https://example.com
+uv run browser-use-terminal tui
+uv run browser-use-terminal sessions list
 ```
 
-By default runtime state is stored under `.llm-browser/`.
+By default runtime state is stored under `.browser-use-terminal/`.
 
 For headless browser tool runs:
 
 ```bash
-LLM_BROWSER_HEADLESS=1 uv run llm-browser run --provider codex --model gpt-5.5 \
+LLM_BROWSER_HEADLESS=1 uv run browser-use-terminal run --provider codex --model gpt-5.5 \
   "Use python headless true. Open https://example.com, screenshot('loaded', attach=True), then call done with the title."
 ```

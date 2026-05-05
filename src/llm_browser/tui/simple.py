@@ -6,6 +6,7 @@ import threading
 from typing import Callable, Optional
 
 from llm_browser.agent import Agent
+from llm_browser.brand import PRODUCT_NAME
 from llm_browser.events import Event
 from llm_browser.provider.base import Provider
 from llm_browser.session.store import SessionStore
@@ -20,11 +21,11 @@ class SimpleTui:
         self.provider_factory = provider_factory or (lambda: None)
 
     def run(self) -> int:
-        print("llm-browser")
+        print(PRODUCT_NAME)
         print("commands: run <task>, sessions, show <session_id>, quit")
         while True:
             try:
-                line = input("llm-browser> ").strip()
+                line = input("but> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0

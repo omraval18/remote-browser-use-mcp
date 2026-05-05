@@ -1,4 +1,4 @@
-"""Browser-specific LLM harness."""
+"""browser use terminal: a browser-specific LLM harness."""
 
 __all__ = ["__version__"]
 

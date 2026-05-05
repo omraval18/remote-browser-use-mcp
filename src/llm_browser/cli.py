@@ -7,15 +7,16 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from llm_browser.agent import Agent
+from llm_browser.brand import CLI_NAME, DEFAULT_STATE_DIR
 from llm_browser.session.store import SessionStore
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="llm-browser")
+    parser = argparse.ArgumentParser(prog=CLI_NAME)
     parser.add_argument(
         "--state-dir",
-        default=".llm-browser",
-        help="Runtime state directory. Defaults to .llm-browser in the current directory.",
+        default=DEFAULT_STATE_DIR,
+        help=f"Runtime state directory. Defaults to {DEFAULT_STATE_DIR} in the current directory.",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
