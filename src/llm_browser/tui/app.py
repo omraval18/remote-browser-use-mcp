@@ -313,14 +313,21 @@ class BrowserUseTerminalApp(App[None]):
 
 
 def _artifact_paths(session: SessionMetadata) -> list[Path]:
+    paths: list[Path] = []
     if not session.artifact_dir.exists():
-        return []
-    paths = [
-        path
-        for path in session.artifact_dir.rglob("*")
-        if path.is_file() and "chrome-profile" not in path.relative_to(session.artifact_dir).parts
-    ]
-    return sorted(paths, key=lambda path: path.stat().st_mtime, reverse=True)[:200]
+        artifact_paths: list[Path] = []
+    else:
+        artifact_paths = [
+            path
+            for path in session.artifact_dir.rglob("*")
+            if path.is_file() and "chrome-profile" not in path.relative_to(session.artifact_dir).parts
+        ]
+    paths.extend(artifact_paths)
+    state_dir = session.state_dir.resolve()
+    cwd = session.cwd.resolve()
+    if cwd.exists() and cwd != session.artifact_dir.resolve() and state_dir in cwd.parents:
+        paths.extend([path for path in cwd.rglob("*") if path.is_file()])
+    return sorted(set(paths), key=lambda path: path.stat().st_mtime, reverse=True)[:200]
 
 
 def _artifact_kind(path: Path) -> str:
@@ -333,6 +340,8 @@ def _artifact_kind(path: Path) -> str:
         return "download"
     if "tool-output" in path.parts:
         return "tool"
+    if "dataset-runs" in path.parts:
+        return "workspace"
     return suffix.lstrip(".") or "file"
 
 

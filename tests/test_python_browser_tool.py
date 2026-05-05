@@ -89,14 +89,18 @@ class PythonBrowserToolTest(unittest.TestCase):
                         [
                             "new_tab('https://example.com')",
                             "screenshot('loaded', attach=True)",
-                            "result = {'title': js('document.title'), 'cwd': str(Path.cwd())}",
+                            "Path('artifact.txt').write_text('saved')",
+                            "saved_path = save_artifact('artifact.txt')",
+                            "result = {'title': js('document.title'), 'cwd': str(Path.cwd()), 'saved_path': saved_path}",
                         ]
                     ),
                 },
             )
 
             self.assertTrue(result.data["ok"])
-            self.assertEqual(result.data["result"], {"title": "Example Domain", "cwd": str(session.cwd)})
+            self.assertEqual(result.data["result"]["title"], "Example Domain")
+            self.assertEqual(result.data["result"]["cwd"], str(session.cwd))
+            self.assertTrue(Path(result.data["result"]["saved_path"]).exists())
             self.assertEqual(result.images[0].label, "loaded")
 
             provider_content = result.to_provider_content()

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -115,7 +116,16 @@ class PythonBrowserTool:
             path.write_text(code, encoding="utf-8")
             return str(path)
 
-        def save_artifact(name: str, content: Any, mode: str = "text") -> str:
+        def save_artifact(name: str, content: Any = None, mode: str = "text") -> str:
+            source = Path(name).expanduser()
+            if content is None and source.exists():
+                if not source.is_absolute():
+                    source = (ctx.session.cwd / source).resolve()
+                safe_name = source.name
+                path = ctx.session.artifact_dir / "python-artifacts" / safe_name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, path)
+                return str(path)
             safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in name)
             path = ctx.session.artifact_dir / "python-artifacts" / safe_name
             path.parent.mkdir(parents=True, exist_ok=True)

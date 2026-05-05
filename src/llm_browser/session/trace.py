@@ -17,6 +17,12 @@ def build_trace_bundle(store: SessionStore, session_id: str, max_events: int = 3
         for path in sorted(session.artifact_dir.rglob("*")):
             if path.is_file() and "chrome-profile" not in path.relative_to(session.artifact_dir).parts:
                 artifacts.append({"path": str(path), "bytes": path.stat().st_size})
+    state_dir = session.state_dir.resolve()
+    cwd = session.cwd.resolve()
+    if cwd.exists() and cwd != session.artifact_dir.resolve() and state_dir in cwd.parents:
+        for path in sorted(cwd.rglob("*")):
+            if path.is_file():
+                artifacts.append({"path": str(path), "bytes": path.stat().st_size, "kind": "workspace"})
     return {
         "session": session.to_dict(),
         "events": [event.to_dict() for event in events[-max_events:]],
