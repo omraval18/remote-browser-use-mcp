@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,9 +19,10 @@ from llm_browser.tool.result import ToolImage
 
 
 class BrowserRuntime:
-    def __init__(self, root_dir: Path, http_url: Optional[str] = None) -> None:
+    def __init__(self, root_dir: Path, http_url: Optional[str] = None, preserve_profile: bool = False) -> None:
         self.root_dir = root_dir
         self.http_url = http_url
+        self.preserve_profile = preserve_profile
         self.chrome: Optional[ChromeProcess] = None
         self.client: Optional[CdpClient] = None
         self.target: Optional[Dict[str, Any]] = None
@@ -27,7 +30,7 @@ class BrowserRuntime:
 
     @classmethod
     def start(cls, root_dir: Path, headless: bool = False) -> "BrowserRuntime":
-        runtime = cls(root_dir=root_dir)
+        runtime = cls(root_dir=root_dir, preserve_profile=_env_bool("LLM_BROWSER_KEEP_CHROME_PROFILE", False))
         try:
             runtime.chrome = start_chrome(root_dir=root_dir, headless=headless)
             runtime.http_url = runtime.chrome.http_url
@@ -39,7 +42,7 @@ class BrowserRuntime:
 
     @classmethod
     def attach(cls, root_dir: Path, http_url: str) -> "BrowserRuntime":
-        runtime = cls(root_dir=root_dir, http_url=http_url.rstrip("/"))
+        runtime = cls(root_dir=root_dir, http_url=http_url.rstrip("/"), preserve_profile=True)
         runtime.attach_first_page()
         return runtime
 
@@ -48,8 +51,11 @@ class BrowserRuntime:
             self.client.close()
             self.client = None
         if self.chrome is not None:
+            profile_dir = self.chrome.config.user_data_dir
             self.chrome.stop()
             self.chrome = None
+            if not self.preserve_profile:
+                shutil.rmtree(profile_dir, ignore_errors=True)
 
     def version(self) -> Dict[str, Any]:
         return requests.get(f"{self.http_url}/json/version", timeout=5).json()
@@ -264,3 +270,10 @@ def _key_event(key: str) -> Dict[str, Any]:
         vk = ord(key.upper())
         return {"key": key, "text": key, "code": f"Key{key.upper()}", "windowsVirtualKeyCode": vk}
     return {"key": key, "code": key}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
