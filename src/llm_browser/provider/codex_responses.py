@@ -28,7 +28,7 @@ class CodexResponsesProvider:
         timeout_s: float = 120.0,
     ) -> None:
         self.auth = auth or load_codex_auth()
-        self.model = model or os.environ.get("LLM_BROWSER_CODEX_MODEL") or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.2"
+        self.model = model or os.environ.get("LLM_BROWSER_CODEX_MODEL") or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.5"
         self.base_url = base_url or os.environ.get("LLM_BROWSER_CODEX_BASE_URL") or DEFAULT_CODEX_BASE_URL
         self.timeout_s = timeout_s
 

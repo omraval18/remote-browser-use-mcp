@@ -24,7 +24,7 @@ class OpenAIResponsesProvider:
         timeout_s: float = 120.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.model = model or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.2"
+        self.model = model or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.5"
         self.base_url = (base_url or os.environ.get("LLM_BROWSER_OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip(
             "/"
         )
