@@ -13,6 +13,12 @@ from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
 
+MAX_INLINE_TOOL_TEXT = 20000
+
+
+class MaxTurnsExceeded(RuntimeError):
+    pass
+
 
 class Agent:
     def __init__(
@@ -20,7 +26,7 @@ class Agent:
         store: SessionStore,
         provider: Optional[Provider] = None,
         tools: Optional[ToolRegistry] = None,
-        max_turns: int = 20,
+        max_turns: int = 80,
     ) -> None:
         self.store = store
         self.provider = provider or FakeProvider()
@@ -84,6 +90,9 @@ class Agent:
                 if final_result is not None:
                     break
 
+            if final_result is None:
+                raise MaxTurnsExceeded(f"model did not call done within {self.max_turns} turns")
+
             session = self.store.update_status(session.id, "done")
             self.store.emit(session.id, "session.done", {"result": final_result})
             self.tools.close_session(session.id)
@@ -110,6 +119,7 @@ class Agent:
         )
         try:
             result = self.tools.run(call.name, call.arguments, ctx)
+            result = self._spill_large_tool_output(ctx, call, result)
             self.store.emit(
                 session_id,
                 "tool.finished",
@@ -132,3 +142,17 @@ class Agent:
                 },
             )
             raise
+
+    def _spill_large_tool_output(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> ToolResult:
+        if len(result.text) <= MAX_INLINE_TOOL_TEXT:
+            return result
+
+        output_dir = ctx.session.artifact_dir / "tool-output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"{call.id}_{call.name}.txt"
+        path.write_text(result.text, encoding="utf-8")
+        data = dict(result.data)
+        data["truncated"] = True
+        data["output_path"] = str(path)
+        text = result.text[:MAX_INLINE_TOOL_TEXT] + f"\n\n[full output saved to {path}]"
+        return ToolResult(text=text, data=data, images=result.images)

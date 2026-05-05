@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Provider to use.",
     )
     run.add_argument("--model", default=None, help="Model name for provider=openai.")
+    run.add_argument("--max-turns", type=int, default=80, help="Maximum model/tool turns before failing.")
     run.set_defaults(func=cmd_run)
 
     sessions = sub.add_parser("sessions", help="Inspect sessions.")
@@ -89,7 +90,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         from llm_browser.provider.codex_responses import CodexResponsesProvider
 
         provider = CodexResponsesProvider(model=args.model)
-    agent = Agent(store, provider=provider)
+    agent = Agent(store, provider=provider, max_turns=args.max_turns)
     session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
