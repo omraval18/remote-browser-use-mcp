@@ -108,6 +108,32 @@ def identify(name: str, timeout_s: float = 1.0) -> Optional[int]:
     return pid if type(pid) is int and 0 < pid < (1 << 31) else None
 
 
+def read_pid(name: str) -> Optional[int]:
+    try:
+        value = int(pid_path(name).read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+    return value if 0 < value < (1 << 31) else None
+
+
+def pid_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def cleanup_stale(name: str) -> None:
+    if ping(name, timeout_s=0.5):
+        return
+    cleanup(name)
+
+
 def cleanup(name: str) -> None:
     for path in (sock_path(name), pid_path(name), port_path(name)):
         try:

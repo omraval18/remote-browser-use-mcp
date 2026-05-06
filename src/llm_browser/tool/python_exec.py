@@ -3,9 +3,11 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sys
+import time
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 def execute_python(code: str, namespace: Dict[str, Any]) -> Any:
@@ -18,6 +20,31 @@ def execute_python(code: str, namespace: Dict[str, Any]) -> Any:
         exec(compile(code, "<llm-browser-python>", "exec"), namespace, namespace)
         return None
     return eval(compiled, namespace, namespace)
+
+
+@contextlib.contextmanager
+def cancellation_trace(cancel_check: Optional[Callable[[], None]], interval_s: float = 0.05) -> Iterator[None]:
+    if cancel_check is None:
+        yield
+        return
+
+    previous = sys.gettrace()
+    next_check_at = 0.0
+
+    def trace(frame: Any, event: str, arg: Any) -> Any:
+        nonlocal next_check_at
+        if event in {"line", "call", "return"}:
+            now = time.monotonic()
+            if now >= next_check_at:
+                cancel_check()
+                next_check_at = now + interval_s
+        return trace
+
+    sys.settrace(trace)
+    try:
+        yield
+    finally:
+        sys.settrace(previous)
 
 
 @contextlib.contextmanager

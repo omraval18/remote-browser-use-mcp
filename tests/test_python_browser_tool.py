@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import Mock, patch
 
+from llm_browser.session.cancel import SessionCancelled
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.python_browser import PythonBrowserTool
@@ -189,6 +190,46 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["clip"]["width"], 340)
             self.assertEqual(runtime_holder["runtime"].last_screenshot_clip["height"], 200)
             self.assertEqual(result.images[0].label, "rates")
+
+    def test_attach_image_rehydrates_existing_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            image_path = session.cwd / "old.png"
+            image_path.write_bytes(b"png-bytes")
+            image_path.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "label": "old_frame",
+                        "url": "https://example.com/old",
+                        "title": "Old",
+                        "viewport": {"width": 100, "height": 80},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(ctx, {"headless": True, "code": "image = attach_image('old.png'); result = image.to_dict()"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.images[0].label, "old_frame")
+            self.assertEqual(result.data["result"]["url"], "https://example.com/old")
+            self.assertEqual(result.images[0].viewport["width"], 100)
+            image_events = [event for event in store.events.read(session.id) if event.type == "tool.image"]
+            self.assertEqual(len(image_events), 1)
+
+    def test_cancelled_python_code_propagates_session_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+            store.request_cancel(session.id, reason="test cancel")
+
+            with self.assertRaises(SessionCancelled):
+                tool(ctx, {"headless": True, "code": "for i in range(1000000):\n    pass"})
 
     def test_relative_state_dir_is_not_affected_by_python_cwd(self) -> None:
         previous = Path.cwd()

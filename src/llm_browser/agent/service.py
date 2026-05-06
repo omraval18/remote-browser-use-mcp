@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -19,6 +20,8 @@ from llm_browser.tool.session import SessionTool, session_tool_spec
 
 MAX_INLINE_TOOL_TEXT = 20000
 DEFAULT_COMPACT_AFTER_CHARS = 120000
+PARALLEL_SAFE_TOOL_NAMES = {"echo", "read", "grep", "glob"}
+PARALLEL_SAFE_SESSION_ACTIONS = {"read", "status", "list"}
 
 
 class MaxTurnsExceeded(RuntimeError):
@@ -124,9 +127,7 @@ class Agent:
                         ],
                     }
                 )
-                for call in tool_calls:
-                    self._check_cancel(session.id)
-                    result = self._execute_tool(session.id, call)
+                for call, result in self._execute_tool_calls(session.id, tool_calls):
                     messages.append(
                         {
                             "role": "tool",
@@ -206,7 +207,11 @@ class Agent:
     def _maybe_compact(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.compact_after_chars <= 0 or message_chars(messages) <= self.compact_after_chars:
             return messages
-        compacted, path = compact_messages(messages, session.artifact_dir)
+        compacted, path = compact_messages(
+            messages,
+            session.artifact_dir,
+            session_events=[event.to_dict() for event in self.store.events.read(session.id)],
+        )
         if compacted is not messages:
             self.store.emit(
                 session.id,
@@ -286,6 +291,48 @@ class Agent:
                 text=f"[tool error: {type(exc).__name__}: {exc}]",
                 data={"ok": False, "error": str(exc), "error_type": type(exc).__name__},
             )
+
+    def _execute_tool_calls(self, session_id: str, tool_calls: List[ToolCall]) -> List[tuple[ToolCall, ToolResult]]:
+        executed: List[tuple[ToolCall, ToolResult]] = []
+        index = 0
+        while index < len(tool_calls):
+            self._check_cancel(session_id)
+            call = tool_calls[index]
+            if call.name == "done" or not self._can_run_parallel(call):
+                result = self._execute_tool(session_id, call)
+                executed.append((call, result))
+                index += 1
+                if call.name == "done":
+                    break
+                continue
+
+            batch: List[ToolCall] = []
+            while index < len(tool_calls) and self._can_run_parallel(tool_calls[index]):
+                batch.append(tool_calls[index])
+                index += 1
+            if len(batch) == 1:
+                executed.append((batch[0], self._execute_tool(session_id, batch[0])))
+                continue
+
+            results: Dict[str, ToolResult] = {}
+            max_workers = min(len(batch), 8)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(self._execute_tool, session_id, call): call for call in batch}
+                for future in concurrent.futures.as_completed(futures):
+                    self._check_cancel(session_id)
+                    call = futures[future]
+                    results[call.id] = future.result()
+            for call in batch:
+                executed.append((call, results[call.id]))
+        return executed
+
+    def _can_run_parallel(self, call: ToolCall) -> bool:
+        if call.name in PARALLEL_SAFE_TOOL_NAMES:
+            return True
+        if call.name == "session":
+            action = str(call.arguments.get("action") or "")
+            return action in PARALLEL_SAFE_SESSION_ACTIONS
+        return False
 
     def _child_provider_factory(self) -> Optional[Provider]:
         provider = self.provider_factory()

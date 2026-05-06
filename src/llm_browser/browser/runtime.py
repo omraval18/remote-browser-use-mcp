@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlparse
 
 import requests
@@ -186,6 +186,7 @@ class BrowserRuntime:
         self._trace_index = 0
         self._event_log: List[Dict[str, Any]] = []
         self.pending_dialog: Optional[Dict[str, Any]] = None
+        self.cancel_check: Optional[Callable[[], None]] = None
         self.downloads_dir = root_dir / "downloads"
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
@@ -356,6 +357,13 @@ class BrowserRuntime:
             "downloads_dir": str(self.downloads_dir),
         }
 
+    def set_cancel_check(self, cancel_check: Optional[Callable[[], None]]) -> None:
+        self.cancel_check = cancel_check
+
+    def _check_cancel(self) -> None:
+        if self.cancel_check is not None:
+            self.cancel_check()
+
     def version(self) -> Dict[str, Any]:
         if not self.http_url:
             return self.cdp("Browser.getVersion")
@@ -505,19 +513,24 @@ class BrowserRuntime:
         timeout_s: Optional[float] = None,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        self._check_cancel()
         if self.client is None:
             self.attach_first_page()
         assert self.client is not None
         effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
         try:
-            return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            self._check_cancel()
+            return result
         except CdpConnectionError:
             if not retry:
                 raise
             self._reattach_after_disconnect()
             assert self.client is not None
             effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-            return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            self._check_cancel()
+            return result
         except CdpError as exc:
             if (
                 retry
@@ -529,7 +542,9 @@ class BrowserRuntime:
                 if target_id:
                     self._attach_browser_target(target_id)
                     effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-                    return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+                    result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+                    self._check_cancel()
+                    return result
             raise
 
     def _reattach_after_disconnect(self) -> None:
@@ -697,6 +712,7 @@ class BrowserRuntime:
     def wait_for_load(self, timeout_s: float = 20.0) -> None:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
+            self._check_cancel()
             try:
                 state = self.js("document.readyState")
                 if state in {"interactive", "complete"}:
@@ -711,6 +727,7 @@ class BrowserRuntime:
         last_error: Optional[Exception] = None
         last_value: Any = None
         while time.time() < deadline:
+            self._check_cancel()
             try:
                 last_value = self.js(expression)
                 if last_value:
@@ -829,6 +846,14 @@ class BrowserRuntime:
             ts_ms=now_ms(),
             url=str(info.get("url", "")),
             title=str(info.get("title", "")),
+            viewport={
+                "width": info.get("w", 0),
+                "height": info.get("h", 0),
+                "scroll_x": info.get("sx", 0),
+                "scroll_y": info.get("sy", 0),
+                "page_width": info.get("pw", 0),
+                "page_height": info.get("ph", 0),
+            },
         )
         path.with_suffix(".json").write_text(json.dumps(image.to_dict(), indent=2) + "\n", encoding="utf-8")
         return image
@@ -904,6 +929,7 @@ class BrowserRuntime:
         self.cdp("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy})
 
     def drain_events(self, timeout_s: float = 0.05, max_events: int = 1000) -> List[Dict[str, Any]]:
+        self._check_cancel()
         if self.client is None:
             return []
         try:
@@ -1009,6 +1035,7 @@ class BrowserRuntime:
         inflight = set()
         active_session = self.default_session_id
         while time.time() < deadline:
+            self._check_cancel()
             for event in self.drain_events(timeout_s=0.05):
                 event_session = event.get("sessionId") or event.get("session_id")
                 if active_session is not None and event_session not in {active_session, None}:

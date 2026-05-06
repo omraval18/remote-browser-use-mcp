@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -323,6 +324,58 @@ class AgentLoopTest(unittest.TestCase):
             self.assertIs(agent.provider, provider)
             self.assertIsInstance(child_provider, FakeProvider)
             self.assertIsNot(child_provider, provider)
+
+    def test_read_only_tool_calls_run_in_parallel_and_preserve_message_order(self) -> None:
+        class ParallelReadProvider:
+            def __init__(self):
+                self.turn = 0
+
+            def start_turn(self, messages, tools):
+                self.turn += 1
+                if self.turn == 1:
+                    yield ModelEvent.call(ToolCall(id="call_a", name="read", arguments={"path": "a.txt"}))
+                    yield ModelEvent.call(ToolCall(id="call_b", name="read", arguments={"path": "b.txt"}))
+                else:
+                    outputs = [message["content"] for message in messages if message.get("role") == "tool"]
+                    yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "|".join(outputs)}))
+
+        starts = {}
+        ends = {}
+
+        def slow_read(ctx: ToolContext, arguments):
+            path = str(arguments["path"])
+            starts[path] = time.monotonic()
+            time.sleep(0.2)
+            ends[path] = time.monotonic()
+            return ToolResult(text=path)
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="read",
+                description="slow read",
+                input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            ),
+            slow_read,
+        )
+        registry.register(
+            ToolSpec(
+                name="done",
+                description="finish",
+                input_schema={"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]},
+            ),
+            lambda ctx, arguments: ToolResult(text=str(arguments.get("result", ""))),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=ParallelReadProvider(), tools=registry).run("parallel", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            self.assertLess(starts["b.txt"], ends["a.txt"])
+            self.assertLess(starts["a.txt"], ends["b.txt"])
+            done = [event for event in store.events.read(session.id) if event.type == "session.done"][-1]
+            self.assertEqual(done.payload["result"], "a.txt|b.txt")
 
 
 if __name__ == "__main__":

@@ -94,6 +94,8 @@ class OpenAIResponsesProvider:
                     }
                 )
                 input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
+        elif any(message.get("role") in {"assistant", "tool"} for message in messages):
+            input_items = self._convert_full_history(messages)
         else:
             user_text = self._latest_user_text(messages)
             input_items.append(
@@ -114,6 +116,48 @@ class OpenAIResponsesProvider:
         if self.previous_response_id:
             payload["previous_response_id"] = self.previous_response_id
         return payload
+
+    def _convert_full_history(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        input_items: List[Dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role == "user":
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    input_items.append({"role": "user", "content": content})
+                else:
+                    input_items.append({"role": "user", "content": [{"type": "input_text", "text": str(content)}]})
+            elif role == "assistant":
+                text = message.get("content")
+                if text:
+                    input_items.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": str(text)}],
+                        }
+                    )
+                for call in message.get("tool_calls") or []:
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": str(call["id"]),
+                            "name": str(call["name"]),
+                            "arguments": json.dumps(call.get("arguments") or {}),
+                        }
+                    )
+            elif role == "tool":
+                call_id = str(message["tool_call_id"])
+                tool_name = str(message.get("name") or "tool")
+                content = message.get("content", "")
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": tool_output_text(content),
+                    }
+                )
+                input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
+        return input_items
 
     def _latest_user_text(self, messages: List[Dict[str, Any]]) -> str:
         for message in reversed(messages):

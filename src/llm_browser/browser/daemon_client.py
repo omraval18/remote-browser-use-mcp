@@ -14,9 +14,11 @@ from llm_browser.tool.result import ToolImage
 
 
 class DaemonBrowserRuntime:
-    def __init__(self, name: str, root_dir: Path) -> None:
+    def __init__(self, name: str, root_dir: Path, headless: bool = False, backend: str = "chromium") -> None:
         self.name = ipc.normalize_name(name)
         self.root_dir = root_dir
+        self.headless = headless
+        self.backend = backend
         self.mode = "daemon"
         self.downloads_dir = root_dir / "runtime" / "downloads"
 
@@ -26,7 +28,7 @@ class DaemonBrowserRuntime:
         name = options.daemon_name or _default_daemon_name(root_dir)
         backend = options.daemon_backend or _default_backend(options)
         ensure_daemon(name=name, root_dir=root_dir / "daemon", headless=headless, backend=backend)
-        return cls(name=name, root_dir=root_dir / "daemon")
+        return cls(name=name, root_dir=root_dir / "daemon", headless=headless, backend=backend)
 
     def close(self) -> None:
         request(self.name, {"meta": "shutdown"}, timeout_s=10)
@@ -39,18 +41,20 @@ class DaemonBrowserRuntime:
         timeout_s: Optional[float] = None,
         retry: bool = True,
     ) -> Dict[str, Any]:
-        response = request(
-            self.name,
-            {
-                "op": "cdp",
-                "method": method,
-                "params": params or {},
-                "session_id": session_id,
-                "timeout_s": timeout_s,
-                "retry": retry,
-            },
-            timeout_s=max(float(timeout_s or 30), 30),
-        )
+        payload = {
+            "op": "cdp",
+            "method": method,
+            "params": params or {},
+            "session_id": session_id,
+            "timeout_s": timeout_s,
+            "retry": retry,
+        }
+        request_timeout_s = max(float(timeout_s or 30), 30)
+        try:
+            response = request(self.name, payload, timeout_s=request_timeout_s)
+        except Exception:
+            ensure_daemon(name=self.name, root_dir=self.root_dir, headless=self.headless, backend=self.backend)
+            response = request(self.name, payload, timeout_s=request_timeout_s)
         return response.get("result") or {}
 
     def connection_info(self) -> Dict[str, Any]:
@@ -188,11 +192,13 @@ class DaemonBrowserRuntime:
         return self._call("save_browser_trace", label=label, include_history=include_history)
 
     def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
-        response = request(
-            self.name,
-            {"op": "call", "name": name, "args": list(args), "kwargs": kwargs},
-            timeout_s=max(float(kwargs.get("timeout_s", 30) or 30), 30),
-        )
+        payload = {"op": "call", "name": name, "args": list(args), "kwargs": kwargs}
+        timeout_s = max(float(kwargs.get("timeout_s", 30) or 30), 30)
+        try:
+            response = request(self.name, payload, timeout_s=timeout_s)
+        except Exception:
+            ensure_daemon(name=self.name, root_dir=self.root_dir, headless=self.headless, backend=self.backend)
+            response = request(self.name, payload, timeout_s=timeout_s)
         return response.get("result")
 
 
@@ -201,6 +207,9 @@ def request(name: str, payload: Dict[str, Any], timeout_s: float = 30.0) -> Dict
 
 
 def ensure_daemon(name: str, root_dir: Path, headless: bool, backend: str, wait_s: float = 20.0) -> None:
+    if ipc.ping(name):
+        return
+    ipc.cleanup_stale(name)
     if ipc.ping(name):
         return
     root_dir.mkdir(parents=True, exist_ok=True)
@@ -219,10 +228,12 @@ def ensure_daemon(name: str, root_dir: Path, headless: bool, backend: str, wait_
     if headless:
         command.append("--headless")
     log = ipc.log_path(name).open("ab")
-    subprocess.Popen(command, env=env, stdout=log, stderr=log, **ipc.spawn_kwargs())
+    process = subprocess.Popen(command, env=env, stdout=log, stderr=log, **ipc.spawn_kwargs())
+    ipc.pid_path(name).write_text(str(process.pid), encoding="utf-8")
     deadline = time.time() + wait_s
     while time.time() < deadline:
-        if ipc.ping(name):
+        pid = ipc.identify(name, timeout_s=0.5)
+        if pid == process.pid or (pid is not None and ipc.pid_alive(pid)):
             return
         time.sleep(0.2)
     raise RuntimeError(f"browser daemon {name!r} did not start; see {ipc.log_path(name)}")
@@ -246,9 +257,20 @@ def stop_daemon(name: str, timeout_s: float = 10.0) -> bool:
 
 def daemon_status(name: str) -> Dict[str, Any]:
     if not ipc.ping(name):
-        return {"ok": False, "name": name, "endpoint": ipc.endpoint(name), "alive": False}
+        pid = ipc.read_pid(name)
+        return {
+            "ok": False,
+            "name": name,
+            "endpoint": ipc.endpoint(name),
+            "alive": False,
+            "pid": pid,
+            "pid_alive": ipc.pid_alive(pid),
+            "log": str(ipc.log_path(name)),
+        }
     status = ipc.request(name, {"meta": "status"}, timeout_s=5)
     status["alive"] = True
+    status["pid_alive"] = ipc.pid_alive(status.get("pid") if isinstance(status.get("pid"), int) else None)
+    status["log"] = str(ipc.log_path(name))
     return status
 
 

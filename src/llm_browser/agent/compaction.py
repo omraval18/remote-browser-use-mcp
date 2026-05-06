@@ -4,7 +4,7 @@ import json
 import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 MAX_SUMMARY_CHARS = 18000
@@ -19,12 +19,13 @@ def compact_messages(
     messages: List[Dict[str, Any]],
     artifact_dir: Path,
     keep_last: int = 12,
+    session_events: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Path]:
     if len(messages) <= keep_last + 1:
         return messages, artifact_dir / "compactions" / "noop.json"
 
     kept = [_trim_message(message) for message in messages[-keep_last:]]
-    summary = _summary(messages[:-keep_last])
+    summary = _summary(messages[:-keep_last], session_events=session_events or [])
     compaction_dir = artifact_dir / "compactions"
     compaction_dir.mkdir(parents=True, exist_ok=True)
     path = compaction_dir / f"{len(list(compaction_dir.glob('*.json'))) + 1:03d}.json"
@@ -45,7 +46,7 @@ def compact_messages(
     return compacted, path
 
 
-def _summary(messages: List[Dict[str, Any]]) -> str:
+def _summary(messages: List[Dict[str, Any]], session_events: List[Dict[str, Any]]) -> str:
     first_user = ""
     recent_tools = []
     tool_refs = []
@@ -77,9 +78,54 @@ def _summary(messages: List[Dict[str, Any]]) -> str:
         parts.append("Known artifact/file paths:\n" + "\n".join(paths[-40:]))
     if errors:
         parts.append("Recent recoverable errors:\n" + "\n\n".join(errors[-5:]))
+    event_summary = _event_summary(session_events)
+    if event_summary:
+        parts.append(event_summary)
     if not parts:
         parts.append(f"Compacted {len(messages)} older message(s). Continue from recent context.")
     return _compact_text("\n\n".join(parts), MAX_SUMMARY_CHARS)
+
+
+def _event_summary(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return ""
+    image_lines: List[str] = []
+    browser_lines: List[str] = []
+    status_lines: List[str] = []
+    for event in events:
+        event_type = str(event.get("type") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event_type == "tool.image":
+            image = payload.get("image") if isinstance(payload.get("image"), dict) else {}
+            label = str(image.get("label") or "screenshot")
+            path = str(image.get("path") or "")
+            url = str(image.get("url") or "")
+            title = str(image.get("title") or "")
+            bits = [label]
+            if title:
+                bits.append(f"title={title[:120]}")
+            if url:
+                bits.append(f"url={url[:180]}")
+            if path:
+                bits.append(f"path={path}")
+            image_lines.append(" | ".join(bits))
+        elif event_type in {"tool.failed", "session.failed", "session.cancelled"}:
+            text = str(payload.get("error") or payload.get("reason") or "")
+            status_lines.append(f"{event_type}: {text[:300]}")
+        elif event_type == "tool.finished":
+            output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+            data = output.get("data") if isinstance(output.get("data"), dict) else {}
+            trace_path = data.get("path") or data.get("output_path")
+            if trace_path:
+                browser_lines.append(f"{payload.get('name', 'tool')} artifact: {trace_path}")
+    parts = []
+    if image_lines:
+        parts.append("Recent screenshot timeline:\n" + "\n".join(image_lines[-16:]))
+    if browser_lines:
+        parts.append("Recent trace/output artifacts:\n" + "\n".join(browser_lines[-12:]))
+    if status_lines:
+        parts.append("Recent status/error events:\n" + "\n".join(status_lines[-8:]))
+    return "\n\n".join(parts)
 
 
 def _message_text(message: Dict[str, Any]) -> str:

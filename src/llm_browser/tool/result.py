@@ -16,6 +16,7 @@ class ToolImage:
     ts_ms: int = 0
     url: str = ""
     title: str = ""
+    viewport: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -27,6 +28,7 @@ class ToolImage:
             "ts_ms": self.ts_ms,
             "url": self.url,
             "title": self.title,
+            "viewport": self.viewport,
         }
 
 

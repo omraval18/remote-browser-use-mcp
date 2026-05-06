@@ -8,7 +8,7 @@ from typing import Any, Dict
 BROWSER_TOOL_DESCRIPTION = (
     "Run persistent Python for browser work. Core primitives: raw cdp(method, params), "
     "js(expr), navigate/new_tab/tabs/switch_tab, click_at/fill_input/press/scroll, "
-    "screenshot(..., attach=True), wait_for_load/wait_for_network_idle, page_info, "
+    "screenshot(..., attach=True), attach_image(path), wait_for_load/wait_for_network_idle, page_info, "
     "download_info, recent_console, recent_network_failures, save_browser_trace, "
     "agent_helpers_path/reload_agent_helpers, shell/file tools separately, and done. "
     "Use help_browser() inside Python for the full helper list and examples. "
@@ -20,6 +20,7 @@ BROWSER_HELP_TEXT = """Browser Python tool quick reference
 
 Core CDP/browser:
   cdp(method, params=None, timeout_s=None, retry=True)
+  check_cancel(), cancel_requested()
   js(expr, await_promise=True, repl_mode=None)
   new_tab(url), navigate(url), tabs(), list_tabs(include_internal=True)
   switch_tab(target), current_tab(), ensure_real_tab(), iframe_target(url_substr)
@@ -35,7 +36,7 @@ Input:
   press(key), press_key(key, modifiers=0), scroll(dx=0, dy=500)
 
 Images and artifacts:
-  screenshot(label, attach=True), screenshot_element(selector, label=None)
+  screenshot(label, attach=True), screenshot_element(selector, label=None), attach_image(path)
   download_info(), save_browser_trace(label)
   save_artifact(name, content=None), upload_artifact(path), create_download_url(path)
   output_path(path=''), download_file(url, path=None), read_pdf_text(path_or_url)
@@ -66,6 +67,8 @@ EXPORT_NAMES = [
     "output_dir",
     "output_path",
     "cdp",
+    "check_cancel",
+    "cancel_requested",
     "new_tab",
     "navigate",
     "tabs",
@@ -81,6 +84,7 @@ EXPORT_NAMES = [
     "dismiss_cookie_banners",
     "screenshot",
     "screenshot_element",
+    "attach_image",
     "page_info",
     "pending_dialog",
     "drain_cdp_events",

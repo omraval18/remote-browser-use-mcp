@@ -146,6 +146,17 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     doctor = sub.add_parser("doctor", help="Print local harness diagnostics.")
     doctor.set_defaults(func=cmd_doctor)
 
+    provider = sub.add_parser("provider", help="Provider diagnostics and smoke tests.")
+    provider_sub = provider.add_subparsers(dest="provider_command", required=True)
+
+    provider_image_smoke = provider_sub.add_parser(
+        "image-smoke",
+        help="Send a two-frame synthetic screenshot timeline through a provider.",
+    )
+    provider_image_smoke.add_argument("--provider", choices=["openai", "codex"], default=_provider_default(config, "codex"))
+    provider_image_smoke.add_argument("--model", default=_model_default(config, "gpt-5.5"))
+    provider_image_smoke.set_defaults(func=cmd_provider_image_smoke)
+
     run = sub.add_parser("run", help="Create a session with a user task.")
     run.add_argument("task", help="Task to give the browser agent.")
     run.add_argument("--parent-id", default=None, help="Optional parent session id.")
@@ -318,6 +329,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def cmd_provider_image_smoke(args: argparse.Namespace) -> int:
+    from llm_browser.provider.image_smoke import run_image_smoke
+
+    provider = make_provider(args.provider, args.model)
+    if provider is None:
+        print("image smoke requires provider=openai or provider=codex", file=sys.stderr)
+        return 2
+    artifact_dir = Path(args.state_dir) / "provider-smoke" / f"{args.provider}-{int(time.time())}"
+    result = run_image_smoke(provider, artifact_dir)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("ok") else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:

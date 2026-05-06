@@ -119,6 +119,37 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][1]["role"], "user")
         self.assertEqual(payload["input"][1]["content"][1]["type"], "input_image")
 
+    def test_sends_full_history_tool_output_without_previous_response_id(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
+        response = FakeResponse(200, {"id": "resp_1", "output": []})
+        content = [
+            {"type": "input_text", "text": "images=[frame_1, frame_2]"},
+            {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,abc"},
+        ]
+
+        with patch("llm_browser.provider.openai_responses.requests.post", return_value=response) as post:
+            list(
+                provider.start_turn(
+                    [
+                        {"role": "user", "content": "validate images"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [{"id": "call_1", "name": "image_probe", "arguments": {}}],
+                        },
+                        {"role": "tool", "tool_call_id": "call_1", "name": "image_probe", "content": content},
+                        {"role": "user", "content": "answer"},
+                    ],
+                    [],
+                )
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["input"][1]["type"], "function_call")
+        self.assertEqual(payload["input"][2]["type"], "function_call_output")
+        self.assertEqual(payload["input"][3]["role"], "user")
+        self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
+        self.assertEqual(payload["input"][4]["content"][0]["text"], "answer")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

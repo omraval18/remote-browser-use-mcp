@@ -21,10 +21,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from llm_browser.browser.helpers import ensure_agent_helpers_file
+from llm_browser.events.event import now_ms
+from llm_browser.session.cancel import SessionCancelled
 from llm_browser.tool.browser_artifacts import browser_use_api_key, upload_to_browser_use_cloud
 from llm_browser.tool.browser_exports import help_browser, install_browser_helpers_module
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.python_exec import execute_python, execution_cwd, is_jsonable
+from llm_browser.tool.python_exec import cancellation_trace, execute_python, execution_cwd, is_jsonable
 from llm_browser.tool.result import ToolImage, ToolResult
 
 if TYPE_CHECKING:
@@ -56,14 +58,34 @@ class PythonBrowserTool:
 
         stdout = io.StringIO()
         stderr = io.StringIO()
+        previous_cancel_check = getattr(self._runtime(ctx, headless=headless), "cancel_check", None)
+
+        def check_cancel() -> None:
+            request = ctx.store.cancel_request(ctx.session.id)
+            if request is not None:
+                raise SessionCancelled(ctx.session.id, request["reason"])
+
+        runtime = self._runtime(ctx, headless=headless)
+        if hasattr(runtime, "set_cancel_check"):
+            runtime.set_cancel_check(check_cancel)
         try:
             with _GLOBAL_EXEC_LOCK:
-                with execution_cwd(ctx.session.cwd, self._exec_lock), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with (
+                    execution_cwd(ctx.session.cwd, self._exec_lock),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                    cancellation_trace(check_cancel),
+                ):
                     value = execute_python(code, namespace)
+        except SessionCancelled:
+            raise
         except BaseException:
             err = stderr.getvalue()
             err += traceback.format_exc()
             return ToolResult(text=stdout.getvalue(), data={"stderr": err, "ok": False}, images=images)
+        finally:
+            if hasattr(runtime, "set_cancel_check"):
+                runtime.set_cancel_check(previous_cancel_check)
 
         if value is None:
             value = namespace.get("_result", namespace.get("result"))
@@ -100,6 +122,14 @@ class PythonBrowserTool:
             _install_optional_imports(namespace)
             self._namespaces[ctx.session.id] = namespace
 
+        def check_cancel() -> None:
+            request = ctx.store.cancel_request(ctx.session.id)
+            if request is not None:
+                raise SessionCancelled(ctx.session.id, request["reason"])
+
+        def cancel_requested() -> bool:
+            return ctx.is_cancel_requested()
+
         def cdp(
             method: str,
             params: Optional[Dict[str, Any]] = None,
@@ -107,14 +137,17 @@ class PythonBrowserTool:
             timeout_s: Optional[float] = None,
             retry: bool = True,
         ) -> Dict[str, Any]:
+            check_cancel()
             return runtime.cdp(method, params=params, session_id=session_id, timeout_s=timeout_s, retry=retry)
 
         def new_tab(url: str = "about:blank") -> Dict[str, Any]:
+            check_cancel()
             return runtime.new_tab(url)
 
         def navigate(url: str, wait: bool = True, timeout_s: float = 20.0, timeout: Optional[float] = None) -> Dict[str, Any]:
             if timeout is not None:
                 timeout_s = timeout
+            check_cancel()
             return runtime.navigate(url, wait=wait, timeout_s=timeout_s)
 
         def js(
@@ -123,6 +156,7 @@ class PythonBrowserTool:
             repl_mode: Optional[bool] = None,
             user_gesture: bool = False,
         ) -> Any:
+            check_cancel()
             return runtime.js(
                 expression,
                 await_promise=await_promise,
@@ -133,11 +167,13 @@ class PythonBrowserTool:
         def wait_for_load(timeout_s: float = 20.0, timeout: Optional[float] = None) -> None:
             if timeout is not None:
                 timeout_s = timeout
+            check_cancel()
             runtime.wait_for_load(timeout_s=timeout_s)
 
         def wait_until(expression: str, timeout_s: float = 20.0, timeout: Optional[float] = None, interval_s: float = 0.25) -> Any:
             if timeout is not None:
                 timeout_s = timeout
+            check_cancel()
             return runtime.wait_until(expression, timeout_s=timeout_s, interval_s=interval_s)
 
         def wait_for_selector(
@@ -148,11 +184,13 @@ class PythonBrowserTool:
         ) -> Any:
             if timeout is not None:
                 timeout_s = timeout
+            check_cancel()
             return runtime.wait_for_selector(selector, timeout_s=timeout_s, visible=visible)
 
         def wait_for_text(text: str, timeout_s: float = 20.0, timeout: Optional[float] = None) -> Any:
             if timeout is not None:
                 timeout_s = timeout
+            check_cancel()
             return runtime.wait_for_text(text, timeout_s=timeout_s)
 
         def deep_text(max_chars: int = 12000) -> str:
@@ -219,6 +257,7 @@ class PythonBrowserTool:
             deadline = time.monotonic() + timeout_s
             last_result: Dict[str, Any] = {"clicked": False, "matches": []}
             while True:
+                check_cancel()
                 result = runtime.js(
                     _click_text_script(
                         text_or_pattern,
@@ -264,6 +303,7 @@ class PythonBrowserTool:
             patterns = accept_patterns if prefer != "reject" else reject_patterns + accept_patterns
             last_result: Dict[str, Any] = {"clicked": False, "matches": []}
             for pattern in patterns:
+                check_cancel()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -821,6 +861,7 @@ class PythonBrowserTool:
                 for index, item_url in enumerate(url_list):
                     attempt = 0
                     while True:
+                        check_cancel()
                         delay = next_allowed_at - time.monotonic()
                         if delay > 0:
                             time.sleep(delay)
@@ -841,6 +882,7 @@ class PythonBrowserTool:
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                     for index, result_item in executor.map(fetch_one, enumerate(url_list)):
+                        check_cancel()
                         results[index] = result_item
                 save_results()
 
@@ -922,6 +964,36 @@ class PythonBrowserTool:
                 ctx.emit_image(image)
             return {"selector": selector, "rect": rect, "clip": clip, "image": image.to_dict()}
 
+        def attach_image(path: str, label: Optional[str] = None, detail: str = "auto") -> ToolImage:
+            image_path = Path(path).expanduser()
+            if not image_path.is_absolute():
+                image_path = ctx.session.cwd / image_path
+            image_path = image_path.resolve()
+            if not image_path.exists():
+                raise FileNotFoundError(str(image_path))
+            sidecar = image_path.with_suffix(".json")
+            metadata: Dict[str, Any] = {}
+            if sidecar.exists():
+                try:
+                    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+                except Exception:
+                    metadata = {}
+            mime = mimetypes.guess_type(str(image_path))[0] or str(metadata.get("mime_type") or "image/png")
+            image = ToolImage(
+                label=label or str(metadata.get("label") or image_path.stem),
+                path=str(image_path),
+                mime_type=mime,
+                detail=detail or str(metadata.get("detail") or "auto"),
+                order=len(images) + 1,
+                ts_ms=now_ms(),
+                url=str(metadata.get("url") or ""),
+                title=str(metadata.get("title") or ""),
+                viewport=dict(metadata.get("viewport") or {}),
+            )
+            images.append(image)
+            ctx.emit_image(image)
+            return image
+
         downloads_dir = getattr(runtime, "downloads_dir", runtime.root_dir / "downloads")
         namespace.update(
             {
@@ -948,6 +1020,7 @@ class PythonBrowserTool:
                 "dismiss_cookie_banners": dismiss_cookie_banners,
                 "screenshot": screenshot,
                 "screenshot_element": screenshot_element,
+                "attach_image": attach_image,
                 "page_info": runtime.page_info,
                 "pending_dialog": getattr(runtime, "pending_dialog_info", lambda *args, **kwargs: None),
                 "drain_cdp_events": getattr(runtime, "drain_events", lambda *args, **kwargs: []),
@@ -1002,6 +1075,8 @@ class PythonBrowserTool:
                 "store_locator_locations": store_locator_locations,
                 "read_sitemap": read_sitemap,
                 "curl_requests": namespace.get("curl_requests"),
+                "check_cancel": check_cancel,
+                "cancel_requested": cancel_requested,
             }
         )
         install_browser_helpers_module(namespace)
@@ -2882,4 +2957,3 @@ def _install_display_shim() -> None:
     display_module.HTML = str
     setattr(ipython_module, "display", display_module)
     sys.modules["IPython.display"] = display_module
-

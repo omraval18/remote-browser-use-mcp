@@ -51,6 +51,18 @@ class BrowserDaemonTest(unittest.TestCase):
         request.assert_called_once()
         self.assertEqual(request.call_args.args[1]["name"], "screenshot")
 
+    def test_daemon_runtime_restarts_and_retries_failed_call(self) -> None:
+        runtime = DaemonBrowserRuntime("demo", Path("/tmp/demo"), headless=True, backend="chromium")
+
+        with patch("llm_browser.browser.daemon_client.request", side_effect=[RuntimeError("stale"), {"result": {"ok": True}}]) as request, patch(
+            "llm_browser.browser.daemon_client.ensure_daemon"
+        ) as ensure:
+            result = runtime.page_info()
+
+        self.assertEqual(result, {"ok": True})
+        ensure.assert_called_once_with(name="demo", root_dir=Path("/tmp/demo"), headless=True, backend="chromium")
+        self.assertEqual(request.call_count, 2)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
