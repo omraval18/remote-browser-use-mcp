@@ -798,6 +798,89 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(cards[0]["title"], "Morrilton")
             self.assertEqual(cards[0]["lines"][:2], ["944 Hwy 287", "Morrilton, AR 72110"])
 
+    def test_extract_emails_filters_template_noise(self) -> None:
+        text = (
+            "Contact Founder@RealExample.com or hello@realexample.com. "
+            "Ignore user@domain.com, you@company.com, error-lite@duckduckgo.com, "
+            "example@mysite.com, and icon-zest-for-life@4x.png."
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": f"result = extract_emails({text!r}, domains='realexample.com')",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            emails = [item["email"] for item in result.data["result"]]
+            self.assertEqual(emails, ["founder@realexample.com", "hello@realexample.com"])
+            self.assertIn("Contact Founder", result.data["result"][0]["context"])
+
+    def test_crawl_site_fetches_contact_pages_and_extracts_email(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.content = text.encode("utf-8")
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+                self.headers = {"content-type": "text/html"}
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        pages = {
+            "https://example.com/": (
+                "<html><title>Home</title><body>"
+                "<a href='/contact'>Contact</a><a href='/team'>Team</a>"
+                "</body></html>"
+            ),
+            "https://example.com/contact": (
+                "<html><title>Contact</title><body>"
+                "<a href='mailto:founder@realexample.com'>founder@realexample.com</a>"
+                "</body></html>"
+            ),
+            "https://example.com/team": "<html><title>Team</title><body>CEO</body></html>",
+        }
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            normalized = url.rstrip("/") + ("/" if url.rstrip("/") == "https://example.com" else "")
+            if normalized in pages:
+                return Response(pages[normalized], normalized)
+            return Response("", url, status_code=404)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": "result = crawl_site('https://example.com', max_pages=4, use_jina=False, timeout=5)",
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            payload = result.data["result"]
+            self.assertIn("founder@realexample.com", payload["emails"])
+            fetched_urls = {page["requested_url"] for page in payload["pages"]}
+            self.assertIn("https://example.com/contact", fetched_urls)
+            contact_page = next(page for page in payload["pages"] if page["requested_url"] == "https://example.com/contact")
+            self.assertEqual(contact_page["title"], "Contact")
+
     def test_search_web_parses_duckduckgo_redirects_and_saves_empty_pages(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:

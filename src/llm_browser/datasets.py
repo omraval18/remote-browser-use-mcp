@@ -99,6 +99,8 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "use screenshot_element(selector, ...) when a specific page element needs to be captured cleanly. "
         "For large sitemap or directory tasks, prefer read_sitemap(...) and fetch_many_text(..., save_to='pages.json') "
         "so bulk pages are fetched in bounded parallelism and saved to disk instead of printed into context. "
+        "For contact/email discovery, prefer crawl_site(url, max_pages=12) and extract_emails(text, domains='example.com') "
+        "before broad web search; they fetch obvious contact/about/team pages in parallel and filter common template noise. "
         "If a reader service or site starts returning 429s, use fetch_many_text(..., requests_per_minute=15, save_to='pages.json') "
         "so work continues serially and writes partial results as it goes. "
         "For store/location directories, look for lower-cardinality state/city/category directory pages or JSON APIs "

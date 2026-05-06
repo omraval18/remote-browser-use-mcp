@@ -18,7 +18,7 @@ import types
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolImage, ToolResult
@@ -598,6 +598,45 @@ class PythonBrowserTool:
                 limit=limit,
             )
 
+        def extract_emails(
+            text: str,
+            domains: Optional[Any] = None,
+            max_results: int = 200,
+            include_context: bool = True,
+        ) -> List[Dict[str, str]]:
+            return _extract_email_records(
+                str(text),
+                domains=_normalize_email_domains(domains),
+                max_results=max_results,
+                include_context=include_context,
+            )
+
+        def crawl_site(
+            start_url: str,
+            max_pages: int = 12,
+            timeout: float = 12.0,
+            max_workers: int = 6,
+            max_chars_per_page: int = 120000,
+            use_jina: Any = "auto",
+            same_site: bool = True,
+            include: Optional[str] = None,
+            exclude: Optional[str] = None,
+            purpose: str = "contact",
+        ) -> Dict[str, Any]:
+            return _crawl_site(
+                fetch_many_text=fetch_many_text,
+                start_url=start_url,
+                max_pages=max_pages,
+                timeout=timeout,
+                max_workers=max_workers,
+                max_chars_per_page=max_chars_per_page,
+                use_jina=use_jina,
+                same_site=same_site,
+                include=include,
+                exclude=exclude,
+                purpose=purpose,
+            )
+
         def read_sitemap(
             url: str,
             include: Optional[str] = None,
@@ -829,6 +868,8 @@ class PythonBrowserTool:
                 "search_web": search_web,
                 "extract_links": extract_links,
                 "extract_markdown_link_blocks": extract_markdown_link_blocks,
+                "extract_emails": extract_emails,
+                "crawl_site": crawl_site,
                 "read_sitemap": read_sitemap,
                 "curl_requests": namespace.get("curl_requests"),
             }
@@ -1357,6 +1398,435 @@ def _extract_cve_ids(text: str) -> List[str]:
             seen.add(cve_id)
             cve_ids.append(cve_id)
     return cve_ids
+
+
+def _normalize_email_domains(domains: Optional[Any]) -> Optional[set[str]]:
+    if domains is None:
+        return None
+    if isinstance(domains, str):
+        raw_domains = [part.strip() for part in re.split(r"[,;\s]+", domains) if part.strip()]
+    else:
+        raw_domains = [str(part).strip() for part in domains if str(part).strip()]
+    normalized = {
+        part.lower().lstrip("@").removeprefix("www.")
+        for part in raw_domains
+        if "." in part.lstrip("@")
+    }
+    return normalized or None
+
+
+def _extract_email_records(
+    text: str,
+    *,
+    domains: Optional[set[str]] = None,
+    max_results: int = 200,
+    include_context: bool = True,
+) -> List[Dict[str, str]]:
+    if max_results <= 0:
+        return []
+    seen: set[str] = set()
+    records: List[Dict[str, str]] = []
+    email_re = re.compile(r"(?<![A-Z0-9._%+\-])[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,24}\b", re.I)
+    for match in email_re.finditer(text or ""):
+        email = match.group(0).strip(".,;:!?)]}'\"").lower()
+        if email in seen or _looks_like_noise_email(email):
+            continue
+        domain = email.rsplit("@", 1)[-1]
+        if domains and not any(domain == item or domain.endswith("." + item) for item in domains):
+            continue
+        seen.add(email)
+        record = {"email": email, "domain": domain}
+        if include_context:
+            start = max(0, match.start() - 100)
+            end = min(len(text), match.end() + 100)
+            context = re.sub(r"\s+", " ", text[start:end]).strip()
+            record["context"] = context[:260]
+        records.append(record)
+        if len(records) >= max_results:
+            break
+    return records
+
+
+def _looks_like_noise_email(email: str) -> bool:
+    if "@" not in email:
+        return True
+    local, domain = email.rsplit("@", 1)
+    local = local.lower().strip(".")
+    domain = domain.lower().strip(".")
+    if not local or not domain or "." not in domain:
+        return True
+    tld = domain.rsplit(".", 1)[-1]
+    blocked_tlds = {"png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "css", "js", "woff", "woff2", "ico"}
+    if tld in blocked_tlds:
+        return True
+    blocked_domains = {
+        "example.com",
+        "example.org",
+        "example.net",
+        "domain.com",
+        "mysite.com",
+        "yourdomain.com",
+        "company.com",
+        "duckduckgo.com",
+    }
+    if domain in blocked_domains or domain.endswith(".example.com"):
+        return True
+    blocked_exact = {
+        "user@domain.com",
+        "you@company.com",
+        "name@example.com",
+        "email@example.com",
+        "test@example.com",
+        "error-lite@duckduckgo.com",
+    }
+    if email in blocked_exact:
+        return True
+    blocked_locals = {
+        "example",
+        "test",
+        "testing",
+        "user",
+        "username",
+        "you",
+        "yourname",
+        "name",
+        "firstname.lastname",
+        "first.last",
+        "email",
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+    }
+    return local in blocked_locals
+
+
+def _crawl_site(
+    *,
+    fetch_many_text: Callable[..., Dict[str, Any]],
+    start_url: str,
+    max_pages: int,
+    timeout: float,
+    max_workers: int,
+    max_chars_per_page: int,
+    use_jina: Any,
+    same_site: bool,
+    include: Optional[str],
+    exclude: Optional[str],
+    purpose: str,
+) -> Dict[str, Any]:
+    root_url = _ensure_http_url(start_url)
+    parsed_root = urlparse(root_url)
+    if not parsed_root.netloc:
+        raise ValueError(f"invalid start_url: {start_url}")
+    site_key = _site_host_key(parsed_root.netloc)
+    include_re = re.compile(include) if include else None
+    exclude_re = re.compile(exclude) if exclude else None
+    page_limit = max(1, min(int(max_pages), 100))
+    worker_limit = max(1, min(int(max_workers), 32))
+    candidates: Dict[str, Dict[str, Any]] = {}
+    order = 0
+
+    def add_candidate(raw_url: str, *, base: Optional[str] = None, reason: str = "seed", label: str = "") -> None:
+        nonlocal order
+        normalized = _normalize_crawl_url(raw_url, base_url=base or root_url)
+        if not normalized:
+            return
+        parsed = urlparse(normalized)
+        if same_site and not _url_matches_site(parsed, site_key):
+            return
+        if include_re and not include_re.search(normalized):
+            return
+        if exclude_re and exclude_re.search(normalized):
+            return
+        score = _crawl_url_score(normalized, label=label, purpose=purpose)
+        existing = candidates.get(normalized)
+        if existing:
+            existing["score"] = max(int(existing["score"]), score)
+            if reason not in existing["reasons"]:
+                existing["reasons"].append(reason)
+            return
+        candidates[normalized] = {"url": normalized, "score": score, "reasons": [reason], "order": order}
+        order += 1
+
+    add_candidate(root_url, reason="start")
+    for path in _COMMON_CRAWL_PATHS:
+        add_candidate(urljoin(root_url, path), reason="common_path", label=path)
+
+    fetched: set[str] = set()
+    pages: List[Dict[str, Any]] = []
+    aggregate_emails: Dict[str, Dict[str, str]] = {}
+    social_links: Dict[str, str] = {}
+
+    while len(fetched) < page_limit:
+        remaining = [
+            item
+            for item in candidates.values()
+            if item["url"] not in fetched
+        ]
+        if not remaining:
+            break
+        remaining.sort(key=lambda item: (-int(item["score"]), int(item["order"])))
+        batch = remaining[: min(worker_limit, page_limit - len(fetched))]
+        batch_urls = [item["url"] for item in batch]
+        for item_url in batch_urls:
+            fetched.add(item_url)
+        fetched_results = fetch_many_text(
+            batch_urls,
+            max_workers=worker_limit,
+            max_chars=max_chars_per_page,
+            use_jina=use_jina,
+            timeout=timeout,
+        )
+        raw_results = fetched_results.get("results") or []
+        if not isinstance(raw_results, list):
+            raw_results = []
+        for index, result in enumerate(raw_results):
+            if not isinstance(result, dict):
+                continue
+            page_url = str(result.get("final_url") or result.get("url") or batch_urls[index])
+            text = str(result.get("text") or "")
+            page_links = _extract_page_links(text, base_url=page_url, limit=500)
+            for link in page_links:
+                href = link["url"]
+                if href.startswith("mailto:"):
+                    continue
+                add_candidate(href, base=page_url, reason="page_link", label=link.get("text", ""))
+                if _looks_like_social_url(href):
+                    social_links.setdefault(href, href)
+            email_records = _extract_email_records(text, domains=None, max_results=80, include_context=True)
+            for record in email_records:
+                aggregate_emails.setdefault(record["email"], record)
+            high_value_links = [
+                link["url"]
+                for link in sorted(page_links, key=lambda item: -_crawl_url_score(item["url"], label=item.get("text", ""), purpose=purpose))
+                if not link["url"].startswith("mailto:") and _crawl_url_score(link["url"], label=link.get("text", ""), purpose=purpose) > 0
+            ][:25]
+            pages.append(
+                {
+                    "url": page_url,
+                    "requested_url": batch_urls[index] if index < len(batch_urls) else page_url,
+                    "ok": bool(result.get("ok")),
+                    "status": result.get("status"),
+                    "source": result.get("source"),
+                    "chars": result.get("chars", len(text)),
+                    "truncated": bool(result.get("truncated")),
+                    "title": _extract_html_title(text),
+                    "emails": [record["email"] for record in email_records],
+                    "email_records": email_records[:20],
+                    "links": high_value_links,
+                }
+            )
+
+    return {
+        "start_url": root_url,
+        "site": site_key,
+        "fetched": len(fetched),
+        "pages": pages,
+        "emails": list(aggregate_emails),
+        "email_records": list(aggregate_emails.values()),
+        "social_links": list(social_links),
+        "candidate_count": len(candidates),
+        "remaining_candidates": [
+            item["url"]
+            for item in sorted(candidates.values(), key=lambda value: (-int(value["score"]), int(value["order"])))
+            if item["url"] not in fetched
+        ][:50],
+    }
+
+
+_COMMON_CRAWL_PATHS = (
+    "/",
+    "/contact",
+    "/contact-us",
+    "/about",
+    "/about-us",
+    "/team",
+    "/people",
+    "/staff",
+    "/leadership",
+    "/privacy",
+    "/privacy-policy",
+    "/legal",
+    "/impressum",
+    "/sitemap.xml",
+    "/robots.txt",
+    "/llms.txt",
+    "/.well-known/security.txt",
+)
+
+
+def _ensure_http_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        raise ValueError("url is empty")
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value.lstrip("/")
+    parsed = urlparse(value)
+    if parsed.netloc and not parsed.path:
+        return parsed._replace(path="/").geturl()
+    return value
+
+
+def _site_host_key(host: str) -> str:
+    host = host.lower().split(":", 1)[0].strip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _url_matches_site(parsed_url: Any, site_key: str) -> bool:
+    host = _site_host_key(parsed_url.netloc)
+    return host == site_key or host.endswith("." + site_key)
+
+
+def _normalize_crawl_url(raw_url: str, *, base_url: str) -> str:
+    value = html.unescape(str(raw_url or "")).strip()
+    if not value or value.startswith(("#", "javascript:", "tel:", "data:", "blob:")):
+        return ""
+    if value.startswith("mailto:"):
+        return value
+    url = urljoin(base_url, value)
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path_lower = parsed.path.lower()
+    skip_extensions = (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".avif",
+        ".ico",
+        ".css",
+        ".js",
+        ".mjs",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".mp4",
+        ".webm",
+        ".mov",
+        ".zip",
+    )
+    if path_lower.endswith(skip_extensions):
+        return ""
+    return parsed._replace(fragment="").geturl()
+
+
+def _crawl_url_score(url: str, *, label: str = "", purpose: str = "contact") -> int:
+    parsed = urlparse(url)
+    exact_path = parsed.path.rstrip("/") or "/"
+    exact_scores = {
+        "/": 200,
+        "/contact": 165,
+        "/contact-us": 155,
+        "/team": 130,
+        "/people": 130,
+        "/staff": 130,
+        "/leadership": 125,
+        "/about": 115,
+        "/about-us": 110,
+        "/impressum": 105,
+        "/privacy": 60,
+        "/privacy-policy": 60,
+        "/legal": 50,
+        "/sitemap.xml": 45,
+        "/.well-known/security.txt": 35,
+        "/llms.txt": 30,
+        "/robots.txt": 10,
+    }
+    depth = len([part for part in parsed.path.split("/") if part])
+    if exact_path in exact_scores:
+        return max(0, exact_scores[exact_path] - depth * 8)
+    text = (parsed.path + " " + parsed.query + " " + label).lower()
+    score = 0
+    terms = {
+        "contact": 120,
+        "contact-us": 120,
+        "about": 70,
+        "about-us": 70,
+        "team": 85,
+        "people": 85,
+        "staff": 85,
+        "leadership": 85,
+        "founder": 75,
+        "owner": 75,
+        "impressum": 75,
+        "privacy": 35,
+        "legal": 35,
+        "sitemap": 25,
+        "security.txt": 20,
+        "llms.txt": 15,
+    }
+    if purpose and purpose.lower() not in {"contact", "contacts", "email", "emails"}:
+        score += 10
+    for term, value in terms.items():
+        if term in text:
+            score += value
+    return max(0, score - depth * 8)
+
+
+def _extract_page_links(text: str, *, base_url: str, limit: int = 500) -> List[Dict[str, str]]:
+    seen: set[str] = set()
+    links: List[Dict[str, str]] = []
+
+    def add(raw_url: str, label: str = "") -> None:
+        if len(links) >= limit:
+            return
+        normalized = _normalize_crawl_url(raw_url, base_url=base_url)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        links.append({"url": normalized, "text": re.sub(r"\s+", " ", label).strip()[:220]})
+
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(text or "", "html.parser")
+        for node in soup.select("a[href], area[href], link[href]"):
+            add(str(node.get("href") or ""), node.get_text(" ", strip=True) or str(node.get("rel") or ""))
+            if len(links) >= limit:
+                return links
+    except Exception:
+        pass
+
+    for match in re.finditer(r"""<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""", text or "", flags=re.I | re.S):
+        label = re.sub(r"<[^>]+>", " ", match.group(2))
+        add(match.group(1), label)
+        if len(links) >= limit:
+            return links
+    for url in _extract_links(text or "", limit=max(0, limit - len(links))):
+        add(url, "")
+        if len(links) >= limit:
+            return links
+    for email_record in _extract_email_records(text or "", max_results=max(0, limit - len(links)), include_context=False):
+        add("mailto:" + email_record["email"], email_record["email"])
+    return links
+
+
+def _extract_html_title(text: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", text or "", flags=re.I | re.S)
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", match.group(1)))).strip()[:200]
+
+
+def _looks_like_social_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    social_hosts = (
+        "linkedin.com",
+        "twitter.com",
+        "x.com",
+        "facebook.com",
+        "instagram.com",
+        "github.com",
+        "youtube.com",
+        "tiktok.com",
+        "crunchbase.com",
+    )
+    return any(host == item or host.endswith("." + item) for item in social_hosts)
 
 
 def _search_cve_records(cve_ids: List[str], *, limit: int) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
@@ -2063,6 +2533,8 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "search_web",
         "extract_links",
         "extract_markdown_link_blocks",
+        "extract_emails",
+        "crawl_site",
         "read_sitemap",
         "fetch_many_text",
         "requests",
