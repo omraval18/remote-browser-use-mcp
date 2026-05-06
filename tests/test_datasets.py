@@ -90,6 +90,41 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(result["error_type"], "TimeoutError")
         close_session.assert_called_once()
 
+    def test_dataset_timeout_requires_restart_when_worker_keeps_running(self) -> None:
+        release = threading.Event()
+        close_session = Mock()
+
+        class StuckAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock(close_session=close_session)
+
+            def run_session(self, session_id: str, prompt: str):
+                release.wait(5)
+                return store.load(session_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            try:
+                with patch("llm_browser.cli.Agent", StuckAgent), patch("llm_browser.cli.DATASET_TIMEOUT_DRAIN_S", 0.01):
+                    result = _run_dataset_task(
+                        store=store,
+                        task_id="1",
+                        prompt="hang",
+                        workspace=Path(tmp) / "work",
+                        provider_name="fake",
+                        model=None,
+                        max_turns=1,
+                        timeout_s=0.01,
+                    )
+            finally:
+                release.set()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "TimeoutError")
+        self.assertTrue(result["fatal_runner_restart_required"])
+        self.assertIn("runner must restart", result["error"])
+        close_session.assert_called_once()
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

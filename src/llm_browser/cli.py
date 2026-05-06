@@ -24,6 +24,8 @@ from llm_browser.provider.base import Provider
 from llm_browser.session.trace import build_self_eval_prompt, write_trace_bundle
 from llm_browser.session.store import SessionStore
 
+DATASET_TIMEOUT_DRAIN_S = 10.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_NAME)
@@ -301,6 +303,9 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
         )
         manifest["sessions"].append(result)
         _write_dataset_manifest(store, run_id, manifest)
+        if result.get("fatal_runner_restart_required"):
+            print(json.dumps(manifest, indent=2))
+            return 124
         if args.stop_on_failure and not result.get("ok"):
             print(json.dumps(manifest, indent=2))
             return 1
@@ -417,7 +422,8 @@ def _run_dataset_task(
                     agent.tools.close_session(session.id)
                 except Exception as exc:
                     result["cleanup_error"] = str(exc)
-            thread.join(10)
+            thread.join(DATASET_TIMEOUT_DRAIN_S)
+            still_alive = thread.is_alive()
             loaded = store.load(session.id)
             if loaded is not None:
                 if loaded.status == "running":
@@ -425,6 +431,12 @@ def _run_dataset_task(
                     store.emit(session.id, "session.cancelled", {"reason": f"dataset task timeout after {timeout_s:g}s"})
                 result["session"] = loaded.to_dict()
             result.update({"ok": False, "error": f"dataset task timeout after {timeout_s:g}s", "error_type": "TimeoutError"})
+            if still_alive:
+                result["fatal_runner_restart_required"] = True
+                result["error"] = (
+                    f"dataset task timeout after {timeout_s:g}s; worker thread did not stop cleanly, "
+                    "so the runner must restart before running another task"
+                )
             return result
     else:
         target()

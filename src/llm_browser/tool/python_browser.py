@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from llm_browser.browser import BrowserRuntime
 
 RuntimeFactory = Callable[[Path, bool], "BrowserRuntime"]
+_GLOBAL_EXEC_LOCK = threading.RLock()
 
 
 class PythonBrowserTool:
@@ -50,8 +51,9 @@ class PythonBrowserTool:
         stdout = io.StringIO()
         stderr = io.StringIO()
         try:
-            with self._execution_cwd(ctx.session.cwd), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                value = self._execute(code, namespace)
+            with _GLOBAL_EXEC_LOCK:
+                with self._execution_cwd(ctx.session.cwd), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    value = self._execute(code, namespace)
         except BaseException:
             err = stderr.getvalue()
             err += traceback.format_exc()
