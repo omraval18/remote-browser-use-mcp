@@ -1361,6 +1361,8 @@ class PythonBrowserToolTest(unittest.TestCase):
                             "result = {"
                             "'text': fetch_text('https://example.com')[:5], "
                             "'structured': fetch_text_result('https://example.com')['source'], "
+                            "'readable': fetch_readable_text('https://example.com')[:5], "
+                            "'structured_readable': fetch_readable_text_result('https://example.com')['source'], "
                             "'many': fetch_many_text(['https://example.com'], save_to='bulk.json')['count'], "
                             "'blocks': extract_markdown_link_blocks('[A](https://example.com/a)')[0]['title'], "
                             "'locator': callable(extract_store_locator_locations), "
@@ -1373,10 +1375,51 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.data["result"]["text"], "hello")
             self.assertEqual(result.data["result"]["structured"], "direct")
+            self.assertEqual(result.data["result"]["readable"], "hello")
+            self.assertEqual(result.data["result"]["structured_readable"], "direct")
             self.assertEqual(result.data["result"]["many"], 1)
             self.assertEqual(result.data["result"]["blocks"], "A")
             self.assertTrue(result.data["result"]["locator"])
             self.assertEqual(result.data["result"]["title"], "Example Domain")
+
+    def test_browser_helpers_search_web_is_sliceable_dict(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        html = "<html><body><a href='https://example.com/a'><h2>Alpha Result</h2></a></body></html>"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response(html, "https://www.bing.com/search?q=alpha")):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_helpers import *\n"
+                            "res = search_web('alpha', include_specialized=False)\n"
+                            "result = {"
+                            "'is_dict': isinstance(res, dict), "
+                            "'first_url': res['results'][0]['url'], "
+                            "'preview': res[:80], "
+                            "'structured': search_web_result('alpha', include_specialized=False)['query']"
+                            "}"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["is_dict"])
+            self.assertEqual(result.data["result"]["first_url"], "https://example.com/a")
+            self.assertIn("Alpha Result", result.data["result"]["preview"])
+            self.assertEqual(result.data["result"]["structured"], "alpha")
 
     def test_browser_use_module_alias_exports_helpers(self) -> None:
         class Response:

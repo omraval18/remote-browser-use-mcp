@@ -3010,6 +3010,39 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         setattr(module, "read_url", fetch_text)
         export_names.extend(["fetch_text", "fetch_text_result", "read_url"])
 
+    structured_fetch_readable_text = namespace.get("fetch_readable_text")
+    if callable(structured_fetch_readable_text):
+        setattr(module, "fetch_readable_text_result", structured_fetch_readable_text)
+
+        def fetch_readable_text(*args: Any, **kwargs: Any) -> str:
+            result = structured_fetch_readable_text(*args, **kwargs)
+            if isinstance(result, dict):
+                return str(result.get("text") or "")
+            return str(result or "")
+
+        setattr(module, "fetch_readable_text", fetch_readable_text)
+        setattr(module, "readable_text", fetch_readable_text)
+        export_names.extend(["fetch_readable_text", "fetch_readable_text_result", "readable_text"])
+
+    structured_search_web = namespace.get("search_web")
+    if callable(structured_search_web):
+        class SearchResult(dict):
+            def __getitem__(self, key: Any) -> Any:
+                if isinstance(key, slice):
+                    return str(dict(self))[key]
+                return super().__getitem__(key)
+
+        setattr(module, "search_web_result", structured_search_web)
+
+        def search_web(*args: Any, **kwargs: Any) -> SearchResult:
+            result = structured_search_web(*args, **kwargs)
+            if isinstance(result, dict):
+                return SearchResult(result)
+            return SearchResult({"results": result})
+
+        setattr(module, "search_web", search_web)
+        export_names.extend(["search_web", "search_web_result"])
+
     module.__all__ = [name for name in export_names if hasattr(module, name)]
     sys.modules["browser_helpers"] = module
     sys.modules["browser_use"] = module
