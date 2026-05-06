@@ -100,6 +100,8 @@ def format_event(event: Event) -> str:
         return f"[{event.session_id}] cancel requested: {payload.get('reason', '')}"
     if event.type == "session.compacted":
         return f"[{event.session_id}] compacted: {payload.get('before_messages')} -> {payload.get('after_messages')} messages"
+    if event.type == "session.deadline_warning":
+        return f"[{event.session_id}] deadline warning: {payload.get('remaining_s')}s remaining"
     if event.type == "model.delta":
         return f"[{event.session_id}] model: {payload.get('text', '').rstrip()}"
     if event.type == "tool.started":
