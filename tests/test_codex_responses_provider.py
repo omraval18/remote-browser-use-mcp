@@ -74,6 +74,8 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertTrue(payload["stream"])
         self.assertFalse(payload["store"])
         self.assertEqual(payload["model"], "gpt-test")
+        self.assertIn("click_at_xy", payload["instructions"])
+        self.assertIn("whole DOM", payload["instructions"])
         self.assertTrue(post.call_args.kwargs["stream"])
         self.assertTrue(response.closed)
 

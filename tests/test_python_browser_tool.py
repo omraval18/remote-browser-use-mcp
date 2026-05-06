@@ -34,6 +34,12 @@ class FakeRuntime:
         self.last_cdp_timeout = timeout_s
         self.last_cdp_retry = retry
         self.cdp_calls.append({"method": method, "params": params or {}, "session_id": session_id})
+        if method == "DOM.getDocument":
+            return {"root": {"nodeId": 1}}
+        if method == "DOM.querySelector":
+            return {"nodeId": 7}
+        if method == "DOM.setFileInputFiles":
+            return {"ok": True, "files": list((params or {}).get("files") or [])}
         return {"method": method, "params": params or {}, "session_id": session_id}
 
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
@@ -76,6 +82,8 @@ class FakeRuntime:
             return {"clicked": True, "text": "Accept all", "tag": "BUTTON"}
         if "OneTrust.AllowAll" in expression:
             return {"clicked": False}
+        if "KeyboardEvent" in expression:
+            return True
         return None
 
     def wait_for_load(self, timeout_s: float = 20.0) -> None:
@@ -136,6 +144,9 @@ class FakeRuntime:
 
     def scroll(self, dx: float = 0, dy: float = 500, x: float = 500, y: float = 500) -> None:
         return None
+
+    def drain_events(self, timeout_s: float = 0.05, max_events: int = 1000):
+        return [{"method": "Page.loadEventFired"}]
 
     def close(self) -> None:
         return None
@@ -208,6 +219,54 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["clip"]["width"], 340)
             self.assertEqual(runtime_holder["runtime"].last_screenshot_clip["height"], 200)
             self.assertEqual(result.images[0].label, "rates")
+
+    def test_harnesless_aliases_are_available_in_persistent_python_tool(self) -> None:
+        runtime_holder: Dict[str, FakeRuntime] = {}
+
+        def factory(root: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            upload_path = session.cwd / "upload.txt"
+            upload_path.write_text("hello", encoding="utf-8")
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "\n".join(
+                        [
+                            "goto_url('https://example.com')",
+                            "nav = cdp('Page.navigate', url='https://example.com/raw')",
+                            "shot = capture_screenshot('alias-shot.png', attach=True)",
+                            "waited = wait_for_element('#app', timeout=2)",
+                            "events = drain_events()",
+                            "upload = upload_file('input[type=file]', 'upload.txt')",
+                            "clicked = click_at_xy(10, 20)",
+                            "keyed = dispatch_key('input[name=q]', 'Enter')",
+                            "result = {'nav': nav, 'shot': shot, 'waited': waited, 'events': events, 'upload': upload, 'keyed': keyed}",
+                        ]
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["nav"]["params"]["url"], "https://example.com/raw")
+            self.assertTrue(Path(result.data["result"]["shot"]).exists())
+            self.assertEqual(result.images[0].label, "alias-shot")
+            self.assertEqual(result.data["result"]["waited"]["selector"], "#app")
+            self.assertEqual(result.data["result"]["events"], [{"method": "Page.loadEventFired"}])
+            self.assertEqual(result.data["result"]["upload"]["ok"], True)
+            self.assertIn(str(upload_path), result.data["result"]["upload"]["files"])
+            cdp_methods = [call["method"] for call in runtime_holder["runtime"].cdp_calls]
+            self.assertIn("Page.navigate", cdp_methods)
+            self.assertIn("DOM.setFileInputFiles", cdp_methods)
 
     def test_attach_image_rehydrates_existing_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

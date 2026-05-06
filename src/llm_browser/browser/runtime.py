@@ -208,6 +208,10 @@ class BrowserRuntime:
                 return cls.attach_devtools_http(root_dir=root_dir, http_url=options.cdp_http_url, mode="cdp")
             if options.cdp_ws_url:
                 return cls.attach_ws(root_dir=root_dir, websocket_url=options.cdp_ws_url, mode="cdp")
+            if not headless:
+                real = cls._try_attach_real_for_auto(root_dir=root_dir)
+                if real is not None:
+                    return real
             mode = "chromium"
 
         if mode == "cdp":
@@ -330,6 +334,18 @@ class BrowserRuntime:
         runtime.client.connect()
         runtime._initialize_websocket_target()
         return runtime
+
+    @classmethod
+    def _try_attach_real_for_auto(cls, root_dir: Path) -> Optional["BrowserRuntime"]:
+        try:
+            endpoint = discover_real_browser_endpoint(timeout_s=1.0)
+        except Exception:
+            return None
+        if endpoint.http_url:
+            return cls.attach_devtools_http(root_dir=root_dir, http_url=endpoint.http_url, mode="real")
+        if endpoint.websocket_url:
+            return cls.attach_ws(root_dir=root_dir, websocket_url=endpoint.websocket_url, mode="real")
+        return None
 
     def close(self) -> None:
         if self.client is not None:

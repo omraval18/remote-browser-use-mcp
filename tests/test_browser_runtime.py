@@ -196,6 +196,33 @@ class BrowserRuntimeTest(unittest.TestCase):
             self.assertIs(runtime, sentinel)
             attach.assert_called_once_with(root_dir=Path(tmp), http_url="http://127.0.0.1:9222")
 
+    def test_auto_mode_prefers_real_browser_when_not_headless(self) -> None:
+        sentinel = object()
+        endpoint = DiscoveredCdpEndpoint(http_url="http://127.0.0.1:9222", source="test")
+        with tempfile.TemporaryDirectory() as tmp:
+            options = BrowserRuntimeOptions(mode="auto")
+            with patch("llm_browser.browser.runtime.discover_real_browser_endpoint", return_value=endpoint), patch.object(
+                BrowserRuntime, "attach_devtools_http", return_value=sentinel
+            ) as attach:
+                runtime = BrowserRuntime.start(Path(tmp), headless=False, options=options)
+
+        self.assertIs(runtime, sentinel)
+        attach.assert_called_once_with(root_dir=Path(tmp), http_url="http://127.0.0.1:9222", mode="real")
+
+    def test_auto_mode_uses_owned_chromium_when_headless(self) -> None:
+        sentinel = object()
+        with tempfile.TemporaryDirectory() as tmp:
+            options = BrowserRuntimeOptions(mode="auto")
+            with patch("llm_browser.browser.runtime.discover_real_browser_endpoint") as discover, patch(
+                "llm_browser.browser.runtime.start_chrome"
+            ) as start:
+                start.return_value.http_url = "http://127.0.0.1:9333"
+                with patch.object(BrowserRuntime, "attach_first_page", return_value=sentinel):
+                    runtime = BrowserRuntime.start(Path(tmp), headless=True, options=options)
+
+        self.assertEqual(runtime.mode, "chromium")
+        discover.assert_not_called()
+
     def test_attach_ws_can_drive_current_target_without_http_endpoint(self) -> None:
         client = Mock()
         client.call.return_value = {}

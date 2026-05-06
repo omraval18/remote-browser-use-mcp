@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 import requests
 
 from llm_browser.auth import CodexAuth, CodexAuthError, PermanentCodexAuthError, load_codex_auth, refresh_codex_auth
+from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS
 from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
 
@@ -202,11 +203,7 @@ def _codex_url(base_url: str) -> str:
 
 
 def _default_instructions() -> str:
-    return (
-        "You are a browser agent. Use the python tool for raw CDP browser control. "
-        "Prefer compact multi-step browser code with screenshots attached after meaningful actions. "
-        "Do not request whole DOM dumps by default; extract only what you need."
-    )
+    return BROWSER_AGENT_INSTRUCTIONS
 
 
 def _iter_sse_json(response: requests.Response):

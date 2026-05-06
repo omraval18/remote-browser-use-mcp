@@ -50,7 +50,7 @@ def example_config() -> Dict[str, Any]:
         "model": "gpt-5.5",
         "max_turns": 80,
         "browser": {
-            "mode": "chromium",
+            "mode": "auto",
             "headless": False,
             "width": 1280,
             "height": 900,

@@ -144,9 +144,14 @@ class PythonBrowserTool:
             session_id: Optional[str] = None,
             timeout_s: Optional[float] = None,
             retry: bool = True,
+            **kwargs: Any,
         ) -> Dict[str, Any]:
             check_cancel()
-            return runtime.cdp(method, params=params, session_id=session_id, timeout_s=timeout_s, retry=retry)
+            if params is not None and not isinstance(params, dict):
+                raise TypeError("cdp params must be a dict when provided")
+            merged_params = dict(params or {})
+            merged_params.update(kwargs)
+            return runtime.cdp(method, params=merged_params, session_id=session_id, timeout_s=timeout_s, retry=retry)
 
         def new_tab(url: str = "about:blank") -> Dict[str, Any]:
             check_cancel()
@@ -157,6 +162,9 @@ class PythonBrowserTool:
                 timeout_s = timeout
             check_cancel()
             return runtime.navigate(url, wait=wait, timeout_s=timeout_s)
+
+        def goto_url(url: str, wait: bool = True, timeout_s: float = 20.0, timeout: Optional[float] = None) -> Dict[str, Any]:
+            return navigate(url, wait=wait, timeout_s=timeout_s, timeout=timeout)
 
         def js(
             expression: str,
@@ -194,6 +202,18 @@ class PythonBrowserTool:
                 timeout_s = timeout
             check_cancel()
             return runtime.wait_for_selector(selector, timeout_s=timeout_s, visible=visible)
+
+        def wait_for_element(
+            selector: str,
+            timeout: float = 10.0,
+            visible: bool = False,
+            timeout_s: Optional[float] = None,
+        ) -> Any:
+            return wait_for_selector(
+                selector,
+                timeout_s=timeout if timeout_s is None else timeout_s,
+                visible=visible,
+            )
 
         def wait_for_text(text: str, timeout_s: float = 20.0, timeout: Optional[float] = None) -> Any:
             if timeout is not None:
@@ -952,6 +972,47 @@ class PythonBrowserTool:
                 ctx.emit_image(image)
             return image
 
+        def capture_screenshot(
+            path: Optional[str] = None,
+            full: bool = False,
+            max_dim: Optional[int] = None,
+            attach: bool = True,
+            label: Optional[str] = None,
+            timeout_s: float = 8.0,
+        ) -> str:
+            target_path: Optional[Path] = Path(path).expanduser() if path else None
+            if target_path is not None and not target_path.is_absolute():
+                target_path = ctx.session.cwd / target_path
+            image = runtime.screenshot(
+                label=label or (target_path.stem if target_path is not None else "screenshot"),
+                attach=False,
+                full_page=full,
+                timeout_s=timeout_s,
+            )
+            image_path = Path(image.path)
+            if target_path is not None:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if image_path.resolve() != target_path.resolve():
+                    shutil.copy2(image_path, target_path)
+                image_path = target_path
+            if max_dim is not None:
+                _resize_image_max_dim(image_path, int(max_dim))
+            if attach:
+                attached = ToolImage(
+                    label=label or image.label,
+                    path=str(image_path),
+                    mime_type=image.mime_type,
+                    detail=image.detail,
+                    order=image.order,
+                    ts_ms=image.ts_ms,
+                    url=image.url,
+                    title=image.title,
+                    viewport=image.viewport,
+                )
+                images.append(attached)
+                ctx.emit_image(attached)
+            return str(image_path)
+
         def screenshot_element(
             selector: str,
             label: Optional[str] = None,
@@ -1056,6 +1117,56 @@ class PythonBrowserTool:
         def wait_for_download(pattern: Optional[str] = None, timeout_s: float = 30.0, poll_s: float = 0.25) -> Dict[str, Any]:
             return _browser_wait_for_download(runtime, check_cancel, pattern=pattern, timeout_s=timeout_s, poll_s=poll_s)
 
+        def click_at_xy(x: float, y: float, button: str = "left", clicks: int = 1) -> None:
+            check_cancel()
+            runtime.click_at(x, y, button=button, clicks=clicks)
+
+        def dispatch_key(selector: str, key: str = "Enter", event: str = "keypress") -> Any:
+            key_code = _keyboard_code(key)
+            selector_json = json.dumps(selector)
+            key_json = json.dumps(key)
+            event_json = json.dumps(event)
+            return js(
+                "(() => {"
+                f"const e = document.querySelector({selector_json});"
+                "if (!e) return false;"
+                "e.focus();"
+                f"e.dispatchEvent(new KeyboardEvent({event_json}, "
+                f"{{key:{key_json}, code:{key_json}, keyCode:{key_code}, which:{key_code}, bubbles:true}}));"
+                "return true;"
+                "})()",
+                await_promise=True,
+            )
+
+        def upload_file(selector: str, path: Any) -> Dict[str, Any]:
+            files = path if isinstance(path, (list, tuple)) else [path]
+            normalized_files = []
+            for item in files:
+                file_path = Path(str(item)).expanduser()
+                if not file_path.is_absolute():
+                    file_path = ctx.session.cwd / file_path
+                normalized_files.append(str(file_path.resolve()))
+            document = cdp("DOM.getDocument", depth=-1)
+            root = document.get("root") if isinstance(document.get("root"), dict) else {}
+            node_id = cdp("DOM.querySelector", nodeId=root.get("nodeId"), selector=selector).get("nodeId")
+            if not node_id:
+                raise RuntimeError(f"no element for {selector}")
+            return cdp("DOM.setFileInputFiles", files=normalized_files, nodeId=node_id)
+
+        def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 20.0) -> str:
+            try:
+                import requests
+            except Exception as exc:
+                raise RuntimeError("requests is not installed") from exc
+            request_headers = {"User-Agent": "Mozilla/5.0"}
+            if headers:
+                request_headers.update(headers)
+            check_cancel()
+            response = requests.get(url, headers=request_headers, timeout=timeout)
+            check_cancel()
+            response.raise_for_status()
+            return response.text
+
         downloads_dir = getattr(runtime, "downloads_dir", runtime.root_dir / "downloads")
         namespace.update(
             {
@@ -1071,23 +1182,27 @@ class PythonBrowserTool:
                 "cdp": cdp,
                 "new_tab": new_tab,
                 "navigate": navigate,
+                "goto_url": goto_url,
                 "tabs": runtime.tabs,
                 "attach_tab": runtime.attach_tab,
                 "js": js,
                 "wait_for_load": wait_for_load,
                 "wait_until": wait_until,
                 "wait_for_selector": wait_for_selector,
+                "wait_for_element": wait_for_element,
                 "wait_for_text": wait_for_text,
                 "wait_for_network_idle": getattr(runtime, "wait_for_network_idle", lambda *args, **kwargs: False),
                 "deep_text": deep_text,
                 "click_text": click_text,
                 "dismiss_cookie_banners": dismiss_cookie_banners,
                 "screenshot": screenshot,
+                "capture_screenshot": capture_screenshot,
                 "screenshot_element": screenshot_element,
                 "attach_image": attach_image,
                 "page_info": runtime.page_info,
                 "pending_dialog": getattr(runtime, "pending_dialog_info", lambda *args, **kwargs: None),
                 "drain_cdp_events": getattr(runtime, "drain_events", lambda *args, **kwargs: []),
+                "drain_events": getattr(runtime, "drain_events", lambda *args, **kwargs: []),
                 "recent_cdp_events": getattr(runtime, "recent_cdp_events", lambda *args, **kwargs: []),
                 "recent_console": getattr(runtime, "recent_console_events", lambda *args, **kwargs: []),
                 "recent_network": getattr(runtime, "recent_network_events", lambda *args, **kwargs: []),
@@ -1113,16 +1228,19 @@ class PythonBrowserTool:
                 "visible_text": runtime.visible_text,
                 "links": runtime.links,
                 "click_at": runtime.click_at,
+                "click_at_xy": click_at_xy,
                 "fill_input": getattr(runtime, "fill_input", lambda *args, **kwargs: (_raise_runtime("fill_input is unavailable on this runtime"))),
                 "type_text": runtime.type_text,
                 "press": runtime.press,
                 "press_key": getattr(runtime, "press_key", runtime.press),
+                "dispatch_key": dispatch_key,
                 "scroll": runtime.scroll,
                 "list_tabs": getattr(runtime, "list_tabs", runtime.tabs),
                 "current_tab": getattr(runtime, "current_tab", lambda: {}),
                 "switch_tab": getattr(runtime, "switch_tab", runtime.attach_tab),
                 "ensure_real_tab": getattr(runtime, "ensure_real_tab", lambda: None),
                 "iframe_target": getattr(runtime, "iframe_target", lambda url_substr: None),
+                "upload_file": upload_file,
                 "load_helper": load_helper,
                 "save_helper": save_helper,
                 "agent_helpers_path": agent_helpers_path,
@@ -1135,6 +1253,7 @@ class PythonBrowserTool:
                 "download_file": download_file,
                 "read_pdf_text": read_pdf_text,
                 "html_to_text": html_to_text,
+                "http_get": http_get,
                 "fetch_text": fetch_text,
                 "fetch_readable_text": fetch_readable_text,
                 "fetch_many_text": fetch_many_text,
@@ -1179,6 +1298,42 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _raise_runtime(message: str) -> None:
     raise RuntimeError(message)
+
+
+def _resize_image_max_dim(path: Path, max_dim: int) -> None:
+    if max_dim <= 0:
+        return
+    try:
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError("Pillow is required for capture_screenshot(max_dim=...)") from exc
+    with Image.open(path) as image:
+        if max(image.size) <= max_dim:
+            return
+        image.thumbnail((max_dim, max_dim))
+        image.save(path)
+
+
+def _keyboard_code(key: str) -> int:
+    codes = {
+        "Enter": 13,
+        "Tab": 9,
+        "Escape": 27,
+        "Backspace": 8,
+        " ": 32,
+        "ArrowLeft": 37,
+        "ArrowUp": 38,
+        "ArrowRight": 39,
+        "ArrowDown": 40,
+        "Delete": 46,
+        "Home": 36,
+        "End": 35,
+        "PageUp": 33,
+        "PageDown": 34,
+    }
+    if key in codes:
+        return codes[key]
+    return ord(key) if len(key) == 1 else 0
 
 
 def _auto_reload_agent_helpers(workspace: Path, namespace: Dict[str, Any], reload_agent_helpers: Callable[[], Dict[str, Any]]) -> None:

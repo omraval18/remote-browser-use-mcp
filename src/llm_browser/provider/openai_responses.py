@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
 
+from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS
 from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
 
@@ -132,6 +133,7 @@ class OpenAIResponsesProvider:
             "model": self.model,
             "input": input_items,
             "store": True,
+            "instructions": BROWSER_AGENT_INSTRUCTIONS,
         }
         if tools:
             payload["tools"] = tools

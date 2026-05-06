@@ -4,42 +4,49 @@ import sys
 import types
 from typing import Any, Dict
 
+from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
+
 
 BROWSER_TOOL_DESCRIPTION = (
-    "Run persistent Python for browser work. Core primitives: raw cdp(method, params), "
+    "Run persistent Python for browser work. Core primitives: raw cdp(method, params) or cdp('Domain.method', key=value), "
     "js(expr), navigate/new_tab/tabs/switch_tab, click_at/fill_input/press/scroll, "
     "screenshot(..., attach=True), attach_image(path), wait_for_load/wait_for_network_idle, page_info, "
     "download_info/wait_for_download, cookies/storage/permissions, recent_console, recent_network_failures, save_browser_trace, "
+    "harnesless-compatible aliases capture_screenshot/goto_url/click_at_xy/wait_for_element/drain_events/upload_file/http_get, "
     "agent_helpers_path/reload_agent_helpers, shell/file tools separately, and done. "
     "Use help_browser() inside Python for the full helper list and examples. "
     "Set result or _result for structured output."
 )
 
 
-BROWSER_HELP_TEXT = """Browser Python tool quick reference
+BROWSER_HELP_TEXT = (
+    "Browser Python tool quick reference\n\n"
+    + BROWSER_HELP_PLAYBOOK.rstrip()
+    + """
 
 Core CDP/browser:
-  cdp(method, params=None, timeout_s=None, retry=True)
+  cdp(method, params=None, timeout_s=None, retry=True) or cdp("Page.navigate", url="...")
   check_cancel(), cancel_requested()
   js(expr, await_promise=True, repl_mode=None)
-  new_tab(url), navigate(url), tabs(), list_tabs(include_internal=True)
+  new_tab(url), navigate(url), goto_url(url), tabs(), list_tabs(include_internal=True)
   switch_tab(target), current_tab(), ensure_real_tab(), iframe_target(url_substr)
 
 Waiting and observation:
-  wait_for_load(), wait_for_selector(selector, visible=False), wait_for_text(text)
+  wait_for_load(), wait_for_selector(selector, visible=False), wait_for_element(selector), wait_for_text(text)
   wait_for_network_idle(timeout_s=10, idle_ms=500)
   page_info(), pending_dialog(), visible_text(), deep_text(), links()
-  drain_cdp_events(), recent_console(), recent_network(), recent_network_failures()
+  drain_cdp_events(), drain_events(), recent_console(), recent_network(), recent_network_failures()
   get_cookies(), set_cookie(...), clear_cookies()
   storage_state(), clear_storage(origin=None)
   grant_permissions([...], origin=None), reset_permissions()
 
 Input:
-  click_at(x, y), fill_input(selector, text), type_text(text)
-  press(key), press_key(key, modifiers=0), scroll(dx=0, dy=500)
+  click_at(x, y), click_at_xy(x, y), fill_input(selector, text), type_text(text)
+  press(key), press_key(key, modifiers=0), dispatch_key(selector, key="Enter"), scroll(dx=0, dy=500)
+  upload_file(selector, path)
 
 Images and artifacts:
-  screenshot(label, attach=True), screenshot_element(selector, label=None), attach_image(path)
+  screenshot(label, attach=True), capture_screenshot(path=None, attach=True), screenshot_element(selector, label=None), attach_image(path)
   download_info(), wait_for_download(pattern=None), save_browser_trace(label)
   save_artifact(name, content=None), upload_artifact(path), create_download_url(path)
   output_path(path=''), download_file(url, path=None), read_pdf_text(path_or_url)
@@ -50,6 +57,7 @@ Editable helpers:
   from browser_helpers import *
 
 Fetch/extract helpers:
+  http_get(url)
   fetch_text(url), fetch_readable_text(url), fetch_many_text(urls)
   search_web(query), crawl_site(url), html_to_text(markup), read_sitemap(url)
   extract_links(text), extract_emails(text), extract_markdown_link_blocks(text)
@@ -60,6 +68,7 @@ Example:
   screenshot("loaded", attach=True)
   result = {"title": js("document.title"), "text": visible_text(1000)}
 """
+)
 
 
 EXPORT_NAMES = [
@@ -75,23 +84,27 @@ EXPORT_NAMES = [
     "sleep",
     "new_tab",
     "navigate",
+    "goto_url",
     "tabs",
     "attach_tab",
     "js",
     "wait_for_load",
     "wait_until",
     "wait_for_selector",
+    "wait_for_element",
     "wait_for_text",
     "wait_for_network_idle",
     "deep_text",
     "click_text",
     "dismiss_cookie_banners",
     "screenshot",
+    "capture_screenshot",
     "screenshot_element",
     "attach_image",
     "page_info",
     "pending_dialog",
     "drain_cdp_events",
+    "drain_events",
     "recent_cdp_events",
     "recent_console",
     "recent_network",
@@ -109,16 +122,19 @@ EXPORT_NAMES = [
     "visible_text",
     "links",
     "click_at",
+    "click_at_xy",
     "fill_input",
     "type_text",
     "press",
     "press_key",
+    "dispatch_key",
     "scroll",
     "list_tabs",
     "current_tab",
     "switch_tab",
     "ensure_real_tab",
     "iframe_target",
+    "upload_file",
     "load_helper",
     "save_helper",
     "agent_helpers_path",
@@ -130,6 +146,7 @@ EXPORT_NAMES = [
     "artifact_download_url",
     "download_file",
     "read_pdf_text",
+    "http_get",
     "html_to_text",
     "fetch_readable_text",
     "search_web",

@@ -61,6 +61,8 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][0]["role"], "user")
         self.assertEqual(payload["tools"][0]["name"], "echo")
         self.assertTrue(payload["store"])
+        self.assertIn("screenshot", payload["instructions"])
+        self.assertIn("raw CDP", payload["instructions"])
 
     def test_sends_function_call_output_with_previous_response_id(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
