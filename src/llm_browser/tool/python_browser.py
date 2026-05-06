@@ -527,6 +527,8 @@ class PythonBrowserTool:
                         parsed = _parse_bing_results(text, limit=max_results - len(results))
                     elif source.startswith("duckduckgo"):
                         parsed = _parse_duckduckgo_results(text, limit=max_results - len(results))
+                    elif source == "brave":
+                        parsed = _parse_brave_results(text, limit=max_results - len(results))
                     elif source.endswith("_reader"):
                         parsed = _parse_markdown_links(text, limit=max_results - len(results), source=source)
                     else:
@@ -1132,6 +1134,37 @@ def _parse_duckduckgo_results(page: str, limit: int) -> List[Dict[str, str]]:
     return _parse_generic_search_results(page, source="duckduckgo", limit=limit)
 
 
+def _parse_brave_results(page: str, limit: int) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if limit <= 0:
+        return results
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(page, "html.parser")
+        for link in soup.select(".snippet a[href], a[href][data-testid='result-title-a'], a.result-header[href]"):
+            title = link.get_text(" ", strip=True)
+            url = _normalize_search_url(str(link.get("href") or ""))
+            if not title:
+                continue
+            snippet = title
+            parent = link
+            for _ in range(4):
+                parent = parent.parent
+                if parent is None:
+                    break
+                parent_text = parent.get_text(" ", strip=True)
+                if len(parent_text) > len(title):
+                    snippet = parent_text
+                    break
+            _append_search_result(results, title=title, url=url, snippet=snippet, source="brave", limit=limit)
+            if len(results) >= limit:
+                return results
+    except Exception:
+        pass
+    return results
+
+
 def _parse_generic_search_results(page: str, *, source: str, limit: int) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     if limit <= 0:
@@ -1246,6 +1279,8 @@ def _looks_like_external_result_url(url: str) -> bool:
         "google.com",
         "google.",
         "startpage.com",
+        "brave.com",
+        "brave.app",
         "search.brave.com",
         "mojeek.com",
         "kagi.com",

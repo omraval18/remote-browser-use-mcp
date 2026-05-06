@@ -931,6 +931,51 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertFalse(result.data["result"]["results"])
             self.assertFalse(any("eutils.ncbi.nlm.nih.gov" in url or "api.crossref.org" in url for url in called_urls))
 
+    def test_search_web_parses_brave_snippets_without_footer_links(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        brave_html = (
+            '<div class="snippet">'
+            '<a href="https://www.kaufland.de/product/459358076/">'
+            'Kaufland kaufland.de › product › 459358076 Kijimea K53 Advance</a>'
+            '<p>Kijimea K53 Advance Kapseln 84 St Nahrungsergänzungsmittel</p>'
+            "</div>"
+            '<footer><a href="https://brave.com/download/">Brave Browser</a></footer>'
+        )
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            if "search.brave.com" in url:
+                return Response(brave_html, url)
+            return Response("<html><title>empty</title></html>", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": "result = search_web('site:kaufland.de/product supplements', max_results=3, include_specialized=False)",
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            urls = [item["url"] for item in result.data["result"]["results"]]
+            self.assertEqual(urls, ["https://www.kaufland.de/product/459358076/"])
+
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:
