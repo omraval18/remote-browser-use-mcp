@@ -129,6 +129,44 @@ class AgentLoopTest(unittest.TestCase):
             self.assertTrue(Path(large_output["data"]["output_path"]).exists())
             self.assertIn("full output saved", large_output["text"])
 
+    def test_large_done_result_is_preserved_while_event_output_spills(self) -> None:
+        final_text = "x" * 21000
+
+        class LargeDoneProvider:
+            def start_turn(self, messages, tools):
+                yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": final_text}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            Agent(store, provider=LargeDoneProvider()).run("large final", cwd=Path(tmp))
+            events = store.events.read(store.list()[0].id)
+            done_event = [event for event in events if event.type == "session.done"][-1]
+            done_output = [
+                event.payload["output"]
+                for event in events
+                if event.type == "tool.finished" and event.payload["name"] == "done"
+            ][0]
+
+            self.assertEqual(done_event.payload["result"], final_text)
+            self.assertTrue(done_output["data"]["truncated"])
+            self.assertTrue(Path(done_output["data"]["output_path"]).exists())
+
+    def test_done_can_use_workspace_file_as_final_result(self) -> None:
+        final_text = "{\"stores\":[{\"name\":\"Example\",\"address\":\"1 Main St\"}]}" * 500
+
+        class DonePathProvider:
+            def start_turn(self, messages, tools):
+                yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"path": "final.json"}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "final.json").write_text(final_text, encoding="utf-8")
+            store = SessionStore(Path(tmp))
+            Agent(store, provider=DonePathProvider()).run("large final file", cwd=Path(tmp))
+            events = store.events.read(store.list()[0].id)
+            done_event = [event for event in events if event.type == "session.done"][-1]
+
+            self.assertEqual(done_event.payload["result"], final_text)
+
     def test_large_tool_data_spills_without_reinlining_data(self) -> None:
         class LargeDataProvider:
             def __init__(self):

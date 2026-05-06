@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict
 
 from llm_browser.tool.context import ToolContext
@@ -16,6 +17,13 @@ def echo(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
 
 
 def done(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    path_value = arguments.get("path")
+    if path_value:
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute():
+            path = ctx.session.cwd / path
+        text = path.read_text(encoding="utf-8")
+        return ToolResult(text=text, data={"ok": True, "path": str(path), "chars": len(text)})
     return ToolResult(text=str(arguments.get("result", "")))
 
 
@@ -193,11 +201,14 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="done",
-            description="Finish the current task with a final result.",
+            description=(
+                "Finish the current task with a final result. Use result for normal answers. "
+                "Use path for a large final text/JSON/CSV answer already saved in the workspace; "
+                "the file contents become the final result, not a link."
+            ),
             input_schema={
                 "type": "object",
-                "properties": {"result": {"type": "string"}},
-                "required": ["result"],
+                "properties": {"result": {"type": "string"}, "path": {"type": "string"}},
                 "additionalProperties": False,
             },
         ),

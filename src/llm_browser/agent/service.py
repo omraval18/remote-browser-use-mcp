@@ -248,17 +248,17 @@ class Agent:
         )
         try:
             result = self.tools.run(call.name, call.arguments, ctx)
-            result = self._spill_large_tool_output(ctx, call, result)
+            event_result = self._spill_large_tool_output(ctx, call, result)
             self.store.emit(
                 session_id,
                 "tool.finished",
                 {
                     "tool_call_id": call.id,
                     "name": call.name,
-                    "output": result.to_event_payload(),
+                    "output": event_result.to_event_payload(),
                 },
             )
-            return result
+            return result if call.name == "done" else event_result
         except SessionCancelled:
             raise
         except Exception as exc:

@@ -104,8 +104,10 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "before fetching one page per listed item; extract_markdown_link_blocks(...) is useful for repeated directory cards, "
         "and per-item page crawls should be rate-aware and treated as a fallback. "
         "Recover from broken helpers by using raw CDP, JavaScript, shell, requests, or local helper code. "
-        "Respect any output constraints in the task. Once every requested field or artifact is complete, "
-        "call done with the final answer instead of running extra validation loops. "
+        "Respect any output constraints in the task. If the task expects JSON, a schema object, markdown, or text output, "
+        "the final done result must be that exact content, not a file link. For very large final text/JSON you already saved, "
+        "call done with path='file.json' or path='file.txt' so the file contents become the final result. "
+        "Once every requested field or artifact is complete, call done with the final answer instead of running extra validation loops. "
         "Finish by calling done with the final answer.\n\n"
         f"Task:\n{task.text}"
     )
