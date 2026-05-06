@@ -67,8 +67,11 @@ class EventSpineTest(unittest.TestCase):
 
             self.assertTrue(store.is_cancel_requested(session.id))
             self.assertEqual(store.cancel_request(session.id), {"reason": "test cancel"})
+            self.assertEqual(store.load(session.id).status, "cancelled")  # type: ignore[union-attr]
             events = store.events.read(session.id)
-            self.assertEqual(events[-1].type, "session.cancel_requested")
+            self.assertEqual(events[-2].type, "session.cancel_requested")
+            self.assertEqual(events[-1].type, "session.status")
+            self.assertEqual(events[-1].payload, {"status": "cancelled"})
 
             store.clear_cancel(session.id)
             self.assertFalse(store.is_cancel_requested(session.id))

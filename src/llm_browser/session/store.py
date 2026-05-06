@@ -73,6 +73,8 @@ class SessionStore:
             fh.write("\n")
         os.replace(tmp_path, path)
         self.emit(session_id, "session.cancel_requested", payload)
+        if session.status in {"created", "running"}:
+            self.update_status(session_id, "cancelled")
 
     def clear_cancel(self, session_id: str) -> None:
         path = self._cancel_path(session_id)
