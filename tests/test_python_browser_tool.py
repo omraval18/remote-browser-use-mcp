@@ -881,12 +881,55 @@ class PythonBrowserToolTest(unittest.TestCase):
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
             with patch("requests.get", side_effect=fake_get):
-                result = tool(ctx, {"headless": True, "code": "result = search_web('hafnia', max_results=1)"})
+                result = tool(ctx, {"headless": True, "code": "result = search_web('Hafnia alvei animals', max_results=1)"})
 
             self.assertTrue(result.data["ok"])
             payload = result.data["result"]
             self.assertEqual(payload["results"][0]["title"], "Important Hafnia paper")
             self.assertEqual(payload["results"][0]["url"], "https://pubmed.ncbi.nlm.nih.gov/12345/")
+
+    def test_search_web_does_not_use_scholarly_fallbacks_for_commerce_query_by_default(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200, payload: Any = None) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+                self._payload = payload
+
+            def json(self) -> Any:
+                return self._payload if self._payload is not None else json.loads(self.text)
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        called_urls: list[str] = []
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            called_urls.append(url)
+            if "eutils.ncbi.nlm.nih.gov" in url or "api.crossref.org" in url:
+                raise AssertionError(f"specialized fallback should not be used for commerce query: {url}")
+            return Response("<html><title>empty</title></html>", url, payload=["query", [], [], []] if "w/api.php" in url else None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": "result = search_web('site:kaufland.de Nahrungsergaenzungsmittel bestseller', max_results=2)",
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertFalse(result.data["result"]["results"])
+            self.assertFalse(any("eutils.ncbi.nlm.nih.gov" in url or "api.crossref.org" in url for url in called_urls))
 
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:

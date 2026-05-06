@@ -472,7 +472,7 @@ class PythonBrowserTool:
             max_results: int = 8,
             timeout: float = 20.0,
             save_raw: Any = "auto",
-            include_specialized: bool = True,
+            include_specialized: Any = "auto",
         ) -> Dict[str, Any]:
             try:
                 import requests
@@ -546,7 +546,13 @@ class PythonBrowserTool:
                     attempts.append({"source": source, "url": search_url, "error": str(exc)})
                 if len(results) >= max_results:
                     break
-            if include_specialized and len(results) < max_results:
+            specialized_mode = str(include_specialized).lower()
+            specialized_enabled = (
+                include_specialized is True
+                or specialized_mode in {"1", "true", "yes", "always"}
+                or (specialized_mode == "auto" and _query_looks_scholarly(query))
+            )
+            if specialized_enabled and len(results) < max_results:
                 for source, searcher in (
                     ("wikipedia_api", _search_wikipedia_api),
                     ("pubmed_api", _search_pubmed_api),
@@ -1250,6 +1256,34 @@ def _looks_like_external_result_url(url: str) -> bool:
         return False
     blocked_path_parts = ("/search", "/preferences", "/settings", "/account", "/signin", "/login", "/captcha")
     return not any(part in path for part in blocked_path_parts)
+
+
+def _query_looks_scholarly(query: str) -> bool:
+    text = query.strip()
+    lowered = text.lower()
+    scholarly_terms = (
+        "pubmed",
+        "pmid",
+        "ncbi",
+        "doi",
+        "clinical",
+        "randomized",
+        "double-blind",
+        "placebo",
+        "study",
+        "paper",
+        "journal",
+        "author",
+        "bacterium",
+        "bacteria",
+        "strain",
+        "genome",
+        "molecule",
+        "protein",
+    )
+    if any(term in lowered for term in scholarly_terms):
+        return True
+    return bool(re.search(r"\b[A-Z][a-z]{2,15}\s+[a-z]{3,15}\b", text))
 
 
 def _search_wikipedia_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
