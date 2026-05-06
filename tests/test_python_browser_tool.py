@@ -847,6 +847,29 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(payload["attempts"][0]["parsed"], 0)
             self.assertTrue(Path(payload["attempts"][0]["raw_path"]).exists())
 
+    def test_search_web_prioritizes_exact_cve_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "result = search_web('CVE-2020-8166 Rails details', max_results=4, include_specialized=False)",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            payload = result.data["result"]
+            urls = [item["url"] for item in payload["results"]]
+            self.assertEqual(urls[0], "https://nvd.nist.gov/vuln/detail/CVE-2020-8166")
+            self.assertEqual(urls[1], "https://www.cve.org/CVERecord?id=CVE-2020-8166")
+            self.assertIn("/cves/2020/8xxx/CVE-2020-8166.json", urls[3])
+            self.assertEqual(payload["attempts"][0]["source"], "cve_records")
+
     def test_search_web_uses_pubmed_fallback_when_page_search_is_empty(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200, payload: Any = None) -> None:

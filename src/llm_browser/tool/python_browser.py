@@ -519,7 +519,16 @@ class PythonBrowserTool:
                 path.write_text(text, encoding="utf-8", errors="replace")
                 return str(path)
 
+            cve_ids = _extract_cve_ids(query)
+            if cve_ids:
+                found, attempt = _search_cve_records(cve_ids, limit=max_results)
+                added = add_results(found)
+                attempt["parsed"] = len(added)
+                attempts.append(attempt)
+
             for source, search_url in urls:
+                if len(results) >= max_results:
+                    break
                 try:
                     response = requests.get(search_url, headers=_browser_headers(), timeout=timeout)
                     text = response.text
@@ -1336,6 +1345,59 @@ def _query_looks_scholarly(query: str) -> bool:
     )
     has_binomial = bool(re.search(r"\b[A-Z][a-z]{2,15}\s+[a-z]{3,15}\b", text))
     return has_binomial and any(term in lowered for term in biology_context_terms)
+
+
+def _extract_cve_ids(text: str) -> List[str]:
+    seen: set[str] = set()
+    cve_ids: List[str] = []
+    for match in re.finditer(r"\bCVE-\d{4}-\d{4,}\b", text, flags=re.IGNORECASE):
+        cve_id = match.group(0).upper()
+        if cve_id not in seen:
+            seen.add(cve_id)
+            cve_ids.append(cve_id)
+    return cve_ids
+
+
+def _search_cve_records(cve_ids: List[str], *, limit: int) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if limit <= 0:
+        return [], {"source": "cve_records", "skipped": True}
+    results: List[Dict[str, str]] = []
+    for cve_id in cve_ids:
+        parts = cve_id.split("-")
+        year = parts[1]
+        number = parts[2]
+        prefix = f"{number[:-3]}xxx" if len(number) > 3 else "0xxx"
+        candidates = [
+            {
+                "title": f"NVD - {cve_id}",
+                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                "snippet": f"National Vulnerability Database detail page for {cve_id}.",
+                "source": "cve_records",
+            },
+            {
+                "title": f"CVE.org - {cve_id}",
+                "url": f"https://www.cve.org/CVERecord?id={cve_id}",
+                "snippet": f"Official CVE Program record for {cve_id}.",
+                "source": "cve_records",
+            },
+            {
+                "title": f"NVD API - {cve_id}",
+                "url": f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}",
+                "snippet": f"Machine-readable NVD JSON record for {cve_id}.",
+                "source": "cve_records",
+            },
+            {
+                "title": f"CVE List JSON - {cve_id}",
+                "url": f"https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/{year}/{prefix}/{cve_id}.json",
+                "snippet": f"Machine-readable CVE List v5 JSON record for {cve_id}.",
+                "source": "cve_records",
+            },
+        ]
+        for candidate in candidates:
+            results.append(candidate)
+            if len(results) >= limit:
+                return results, {"source": "cve_records", "cve_ids": cve_ids}
+    return results, {"source": "cve_records", "cve_ids": cve_ids}
 
 
 def _search_wikipedia_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
