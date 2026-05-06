@@ -16,7 +16,7 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from llm_browser.agent import SessionManager
 from llm_browser.brand import PRODUCT_NAME
-from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks
+from llm_browser.datasets import build_dataset_prompt, load_dataset, load_manifest, select_tasks, summarize_manifest
 from llm_browser.events import Event
 from llm_browser.provider.base import Provider
 from llm_browser.session.metadata import SessionMetadata
@@ -30,13 +30,14 @@ ProviderFactory = Callable[[], Optional[Provider]]
 class BrowserUseTerminalApp(App[None]):
     CSS = """
     Screen {
-        background: #0b0d10;
-        color: #e5e1d8;
+        background: #0c0e12;
+        color: #eee8dc;
     }
 
     Header {
-        background: #171a20;
-        color: #f4f0e8;
+        background: #171b20;
+        color: #f6efe3;
+        text-style: bold;
     }
 
     #body {
@@ -46,16 +47,16 @@ class BrowserUseTerminalApp(App[None]):
     #statusbar {
         height: 1;
         padding: 0 1;
-        background: #20242b;
-        color: #c9c3b8;
+        background: #252018;
+        color: #d9cdbd;
         text-style: bold;
     }
 
     #left {
         width: 44;
         min-width: 34;
-        background: #11141a;
-        border: tall #2b3039;
+        background: #101318;
+        border: tall #33424b;
     }
 
     #center {
@@ -66,64 +67,66 @@ class BrowserUseTerminalApp(App[None]):
     #right {
         width: 56;
         min-width: 36;
-        background: #11141a;
-        border: tall #2b3039;
+        background: #101318;
+        border: tall #33424b;
     }
 
     #sessions-title, #events-title, #artifacts-title, #detail-title, #preview-title, #help-title {
         height: 1;
         padding: 0 1;
-        background: #20242b;
-        color: #9ccfd8;
+        background: #1b2325;
+        color: #a6e3d7;
         text-style: bold;
     }
 
     #sessions {
         height: 1fr;
-        background: #11141a;
+        background: #101318;
     }
 
     #help {
         height: 8;
         padding: 1;
-        color: #b9b2a7;
-        background: #0f1116;
+        color: #c7baaa;
+        background: #11151a;
     }
 
     #events {
         height: 1fr;
-        border: tall #2b3039;
-        background: #0b0d10;
+        border: tall #2a343a;
+        background: #0c0e12;
     }
 
     #session-detail {
-        height: 10;
+        height: 12;
         padding: 1;
-        color: #d8d1c8;
-        background: #0f1116;
+        color: #ded4c8;
+        background: #11151a;
     }
 
     #artifacts {
         height: 1fr;
-        background: #11141a;
+        background: #101318;
     }
 
     #artifact-preview {
         height: 12;
-        border: tall #2b3039;
-        background: #0b0d10;
+        border: tall #2a343a;
+        background: #0c0e12;
     }
 
     #command {
         height: 3;
-        border: tall #9ccfd8;
-        background: #171a20;
-        color: #f4f0e8;
+        border: tall #a6e3d7;
+        background: #171b20;
+        color: #f6efe3;
     }
 
     DataTable {
-        scrollbar-color: #3c5660;
-        scrollbar-background: #0f1116;
+        background: #101318;
+        color: #e8ded1;
+        scrollbar-color: #47656a;
+        scrollbar-background: #11151a;
     }
     """
 
@@ -166,6 +169,7 @@ class BrowserUseTerminalApp(App[None]):
                     "run <task>\n"
                     "dataset <name> [count|--all]\n"
                     "dataset <name> --task-id <id>\n"
+                    "report <run-id>\n"
                     "show/resume/cancel [id]\n"
                     "trace/eval [id]\n"
                     "open [artifact]\n"
@@ -185,7 +189,7 @@ class BrowserUseTerminalApp(App[None]):
                 yield Static("preview", id="preview-title")
                 yield RichLog(id="artifact-preview", wrap=True, highlight=True, markup=True)
         yield Input(
-            placeholder="run <task>  |  dataset <name> [count]  |  show <id>  |  trace/eval/open  |  help",
+            placeholder="run <task>  |  dataset <name> [count]  |  report <run-id>  |  show/trace/eval/open  |  help",
             id="command",
         )
         yield Footer()
@@ -225,11 +229,11 @@ class BrowserUseTerminalApp(App[None]):
 
     def _write_banner(self) -> None:
         log = self.query_one("#events", RichLog)
-        log.write("[bold #9ccfd8]browser use terminal[/bold #9ccfd8]")
+        log.write("[bold #a6e3d7]browser use terminal[/bold #a6e3d7]")
         log.write(
             "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 --task-id 20[/bold], "
             "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session, "
-            "[bold]open[/bold] an artifact."
+            "[bold]report[/bold] a dataset run, [bold]open[/bold] an artifact."
         )
 
     def _handle_event(self, event: Event) -> None:
@@ -341,6 +345,8 @@ class BrowserUseTerminalApp(App[None]):
         elif command == "artifacts":
             self.refresh_artifacts()
             log.write("[green]artifacts refreshed[/green]")
+        elif command == "report" and len(args) >= 2:
+            self._write_dataset_report(args[1])
         elif command == "show" and len(args) == 2:
             self.selected_session_id = args[1]
             self._load_session_log(args[1])
@@ -523,6 +529,28 @@ class BrowserUseTerminalApp(App[None]):
         self.selected_session_id = child.id
         log.write(f"[bold #9ccfd8]started self-eval {escape(child.id)} for {escape(session_id)}[/bold #9ccfd8]")
 
+    def _write_dataset_report(self, run_id_or_path: str) -> None:
+        log = self.query_one("#events", RichLog)
+        try:
+            manifest = load_manifest(self.store.state_dir, run_id_or_path)
+            summary = summarize_manifest(manifest)
+        except Exception as exc:
+            log.write(f"[red]report failed: {escape(str(exc))}[/red]")
+            return
+
+        failed = _short_task_list(summary["failed_task_ids"])
+        pending = _short_task_list(summary["pending_task_ids"])
+        log.write(
+            "[bold #a6e3d7]dataset report[/bold #a6e3d7] "
+            f"{escape(str(summary['run_id']))}  "
+            f"{escape(str(summary['dataset']))}  "
+            f"passed [green]{summary['passed']}[/green] / {summary['selected']}  "
+            f"failed [red]{summary['failed']}[/red]  "
+            f"pending [yellow]{summary['pending']}[/yellow]"
+        )
+        log.write(f"[red]failed:[/red] {escape(failed)}")
+        log.write(f"[yellow]pending:[/yellow] {escape(pending)}")
+
     def _update_statusbar(self) -> None:
         sessions = self.store.list()
         counts: dict[str, int] = {}
@@ -553,14 +581,18 @@ class BrowserUseTerminalApp(App[None]):
         tools = sum(1 for event in events if event.type == "tool.started")
         artifacts = len(_artifact_paths(session))
         task = self._task_for_session(session)
+        current_tool = _current_tool(events)
+        final_line = _final_line(events)
         detail.update(
             f"[bold]{escape(session.id)}[/bold]\n"
-            f"status: {escape(session.status)}\n"
+            f"status: {_status_markup(session.status)}\n"
             f"parent: {escape(session.parent_id or '-')}\n"
             f"events: {len(events)}  tools: {tools}  images: {images}  artifacts: {artifacts}\n"
+            f"tool: {escape(current_tool)}\n"
             f"updated: {_format_age(session.updated_ms / 1000)}\n"
             f"cwd: {escape(str(session.cwd))}\n"
-            f"task: {escape(task[:220])}"
+            f"task: {escape(task[:180])}\n"
+            f"last: {escape(final_line[:180])}"
         )
 
     def _preview_artifact(self, path: Optional[str], force: bool = False) -> None:
@@ -672,16 +704,79 @@ def _summarize_task_text(text: str) -> str:
     return " ".join(task.split())
 
 
-def _status_text(status: str) -> Text:
+def _short_task_list(task_ids: list[str], limit: int = 12) -> str:
+    if not task_ids:
+        return "-"
+    rendered = ", ".join(str(task_id) for task_id in task_ids[:limit])
+    if len(task_ids) > limit:
+        rendered += f" +{len(task_ids) - limit}"
+    return rendered
+
+
+def _status_markup(status: str) -> str:
     styles = {
-        "running": "bold #9ccfd8",
+        "running": "bold #a6e3d7",
         "done": "bold green",
         "failed": "bold red",
         "cancelled": "bold yellow",
-        "created": "#b9b2a7",
+        "created": "#c7baaa",
+    }
+    return f"[{styles.get(status, '#ded4c8')}]{escape(status)}[/]"
+
+
+def _status_text(status: str) -> Text:
+    styles = {
+        "running": "bold #a6e3d7",
+        "done": "bold green",
+        "failed": "bold red",
+        "cancelled": "bold yellow",
+        "created": "#c7baaa",
     }
     label = status.upper()[:9]
-    return Text(label, style=styles.get(status, "#d8cab8"))
+    return Text(label, style=styles.get(status, "#ded4c8"))
+
+
+def _current_tool(events: list[Event]) -> str:
+    started: dict[str, str] = {}
+    finished: set[str] = set()
+    for event in events:
+        if event.type == "tool.started":
+            call_id = str(event.payload.get("tool_call_id") or "")
+            started[call_id] = str(event.payload.get("name") or "tool")
+        elif event.type in {"tool.finished", "tool.failed"}:
+            finished.add(str(event.payload.get("tool_call_id") or ""))
+
+    for call_id, name in reversed(list(started.items())):
+        if call_id not in finished:
+            return f"{name} {call_id}".strip()
+
+    for event in reversed(events):
+        if event.type == "tool.finished":
+            return f"{event.payload.get('name') or 'tool'} done"
+        if event.type == "tool.failed":
+            return f"{event.payload.get('name') or 'tool'} failed"
+    return "-"
+
+
+def _final_line(events: list[Event]) -> str:
+    for event in reversed(events):
+        if event.type == "session.done":
+            return str(event.payload.get("result") or "done")
+        if event.type == "session.failed":
+            return str(event.payload.get("error") or "failed")
+        if event.type == "session.cancelled":
+            return str(event.payload.get("reason") or "cancelled")
+        if event.type == "tool.finished":
+            output = event.payload.get("output") or {}
+            text = str(output.get("text") or "").strip()
+            return text or f"{event.payload.get('name') or 'tool'} finished"
+        if event.type == "tool.failed":
+            output = event.payload.get("output") or {}
+            text = str(output.get("text") or "").strip()
+            return text or f"{event.payload.get('name') or 'tool'} failed"
+        if event.type == "tool.started":
+            return f"{event.payload.get('name') or 'tool'} running"
+    return "-"
 
 
 def _artifact_kind(path: Path) -> str:

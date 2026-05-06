@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from llm_browser.events import Event
-from llm_browser.tui.app import _format_events_for_log, _summarize_task_text
+from llm_browser.tui.app import _current_tool, _final_line, _format_events_for_log, _short_task_list, _summarize_task_text
 from llm_browser.tui import format_event
 
 
@@ -61,6 +61,35 @@ class TuiTest(unittest.TestCase):
         )
 
         self.assertEqual(_summarize_task_text(text), "Visit a site and save the result.")
+
+    def test_current_tool_tracks_latest_unfinished_call(self) -> None:
+        events = [
+            Event(type="tool.started", session_id="s1", payload={"name": "python", "tool_call_id": "c1"}),
+            Event(type="tool.finished", session_id="s1", payload={"name": "python", "tool_call_id": "c1"}),
+            Event(type="tool.started", session_id="s1", payload={"name": "python", "tool_call_id": "c2"}),
+        ]
+
+        self.assertEqual(_current_tool(events), "python c2")
+
+    def test_current_tool_falls_back_to_last_finished_call(self) -> None:
+        events = [
+            Event(type="tool.started", session_id="s1", payload={"name": "python", "tool_call_id": "c1"}),
+            Event(type="tool.finished", session_id="s1", payload={"name": "python", "tool_call_id": "c1"}),
+        ]
+
+        self.assertEqual(_current_tool(events), "python done")
+
+    def test_final_line_prefers_terminal_session_event(self) -> None:
+        events = [
+            Event(type="tool.finished", session_id="s1", payload={"name": "python", "output": {"text": "intermediate"}}),
+            Event(type="session.done", session_id="s1", payload={"result": "complete"}),
+        ]
+
+        self.assertEqual(_final_line(events), "complete")
+
+    def test_short_task_list_limits_long_runs(self) -> None:
+        self.assertEqual(_short_task_list([]), "-")
+        self.assertEqual(_short_task_list([str(index) for index in range(14)], limit=3), "0, 1, 2 +11")
 
 
 if __name__ == "__main__":
