@@ -1296,29 +1296,46 @@ def _looks_like_external_result_url(url: str) -> bool:
 def _query_looks_scholarly(query: str) -> bool:
     text = query.strip()
     lowered = text.lower()
-    scholarly_terms = (
+    strong_scholarly_terms = (
         "pubmed",
         "pmid",
         "ncbi",
-        "doi",
-        "clinical",
+        "doi:",
+        "doi.org",
+        "arxiv",
+        "clinical trial",
         "randomized",
         "double-blind",
         "placebo",
-        "study",
-        "paper",
+        "research paper",
+        "scientific paper",
+        "peer reviewed",
+        "citation",
+        "citations",
         "journal",
-        "author",
+    )
+    if any(term in lowered for term in strong_scholarly_terms):
+        return True
+    biology_context_terms = (
+        "animal",
+        "animals",
         "bacterium",
         "bacteria",
-        "strain",
+        "clinical",
+        "gene",
         "genome",
+        "infection",
+        "microbial",
         "molecule",
+        "organism",
+        "pathogen",
+        "plant",
         "protein",
+        "species",
+        "strain",
     )
-    if any(term in lowered for term in scholarly_terms):
-        return True
-    return bool(re.search(r"\b[A-Z][a-z]{2,15}\s+[a-z]{3,15}\b", text))
+    has_binomial = bool(re.search(r"\b[A-Z][a-z]{2,15}\s+[a-z]{3,15}\b", text))
+    return has_binomial and any(term in lowered for term in biology_context_terms)
 
 
 def _search_wikipedia_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
