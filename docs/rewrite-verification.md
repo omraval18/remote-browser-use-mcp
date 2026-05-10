@@ -169,6 +169,20 @@ Latest completion-audit deterministic TUI dumps inspected under `/tmp/but-comple
 - `stopped.txt`
 - `browser-refresh.txt` shows live browser details as `tabs 1 open` and `viewport 1440 x 900`
 
+Current-branch deterministic TUI dumps inspected under `/tmp/but-current-tui-audit/` after the latest commits:
+
+- `setup.txt`
+- `ready.txt`
+- `running.txt`
+- `result.txt`
+- `browser.txt`
+- `history.txt`
+- `actions.txt`
+- `help.txt`
+- `developer.txt`
+- `stopped.txt`
+- `browser.txt` shows useful browser state only: backend, title, page, status, live URL, tabs, and viewport.
+
 Latest bounded real Codex dataset attempt:
 
 - state dir `/tmp/but-rust-codex-real-v14-count2-bounded`
