@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (3, include_str!("../migrations/0003_agent_messages.sql")),
     (4, include_str!("../migrations/0004_app_settings.sql")),
+    (5, include_str!("../migrations/0005_unique_agent_paths.sql")),
 ];
 
 pub struct Store {
@@ -1096,6 +1097,21 @@ mod tests {
             store.events_for_session(&parent.id)?.is_empty()
                 || store.events_for_session(&parent.id)?.len() == 1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_child_agent_paths_per_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, "/tmp")?;
+        store.create_child_session(&parent.id, "/tmp", Some("/root/research"), None, None)?;
+        let duplicate =
+            store.create_child_session(&parent.id, "/tmp", Some("/root/research"), None, None);
+        assert!(duplicate.is_err());
+
+        let other_parent = store.create_session(None, "/tmp")?;
+        store.create_child_session(&other_parent.id, "/tmp", Some("/root/research"), None, None)?;
         Ok(())
     }
 
