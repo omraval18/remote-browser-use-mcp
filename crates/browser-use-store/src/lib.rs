@@ -1,0 +1,1116 @@
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use browser_use_protocol::{ArtifactMeta, EventRecord, SessionMeta, SessionStatus};
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::Value;
+use uuid::Uuid;
+
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_initial.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_agent_session_fields.sql"),
+    ),
+    (3, include_str!("../migrations/0003_agent_messages.sql")),
+    (4, include_str!("../migrations/0004_app_settings.sql")),
+];
+
+pub struct Store {
+    state_dir: PathBuf,
+    conn: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub status: String,
+    pub agent_path: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub updated_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub id: String,
+    pub author_session_id: String,
+    pub target_session_id: String,
+    pub content: String,
+    pub trigger_turn: bool,
+    pub created_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    pub id: String,
+    pub session_id: String,
+    pub pid: Option<i64>,
+    pub status: String,
+    pub started_ms: i64,
+    pub ended_ms: Option<i64>,
+}
+
+impl Store {
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
+        let state_dir = state_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("create state dir {}", state_dir.display()))?;
+        std::fs::create_dir_all(state_dir.join("artifacts")).with_context(|| {
+            format!(
+                "create artifact dir {}",
+                state_dir.join("artifacts").display()
+            )
+        })?;
+        let conn = Connection::open(state_dir.join("state.db"))
+            .with_context(|| format!("open {}", state_dir.join("state.db").display()))?;
+        let store = Self { state_dir, conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    fn migrate(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_ms INTEGER NOT NULL
+            );
+            "#,
+        )?;
+        for (version, sql) in MIGRATIONS {
+            let applied = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                    params![version],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if applied {
+                continue;
+            }
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(sql)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_ms) VALUES (?1, ?2)",
+                params![version, now_ms()],
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn create_session(
+        &self,
+        parent_id: Option<&str>,
+        cwd: impl AsRef<Path>,
+    ) -> Result<SessionMeta> {
+        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let now = now_ms();
+        let artifact_root = self.state_dir.join("artifacts").join(&id);
+        std::fs::create_dir_all(&artifact_root)
+            .with_context(|| format!("create artifact root {}", artifact_root.display()))?;
+        let session = SessionMeta {
+            id: id.clone(),
+            parent_id: parent_id.map(ToOwned::to_owned),
+            cwd: cwd.as_ref().display().to_string(),
+            artifact_root: artifact_root.display().to_string(),
+            status: SessionStatus::Created,
+            created_ms: now,
+            updated_ms: now,
+        };
+        self.insert_session(&session)?;
+        self.append_event(&id, "session.created", serde_json::json!({}))?;
+        self.load_session(&id)?
+            .context("created session was not readable")
+    }
+
+    pub fn create_child_session(
+        &self,
+        parent_id: &str,
+        cwd: impl AsRef<Path>,
+        agent_path: Option<&str>,
+        nickname: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<SessionMeta> {
+        self.load_session(parent_id)?
+            .with_context(|| format!("unknown parent session id: {parent_id}"))?;
+        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let now = now_ms();
+        let artifact_root = self.state_dir.join("artifacts").join(&id);
+        std::fs::create_dir_all(&artifact_root)
+            .with_context(|| format!("create artifact root {}", artifact_root.display()))?;
+        let session = SessionMeta {
+            id: id.clone(),
+            parent_id: Some(parent_id.to_string()),
+            cwd: cwd.as_ref().display().to_string(),
+            artifact_root: artifact_root.display().to_string(),
+            status: SessionStatus::Created,
+            created_ms: now,
+            updated_ms: now,
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO sessions(id, parent_id, cwd, artifact_root, status, created_ms, updated_ms, agent_path, agent_nickname, agent_role) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session.id,
+                session.parent_id,
+                session.cwd,
+                session.artifact_root,
+                session.status.as_str(),
+                session.created_ms,
+                session.updated_ms,
+                agent_path,
+                nickname,
+                role,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO agent_edges(parent_session_id, child_session_id, status, created_ms, updated_ms) VALUES (?1, ?2, 'open', ?3, ?3)",
+            params![parent_id, id, now],
+        )?;
+        tx.commit()?;
+        self.append_event(&id, "session.created", serde_json::json!({}))?;
+        self.load_session(&id)?
+            .context("created child session was not readable")
+    }
+
+    pub fn set_status(&self, session_id: &str, status: SessionStatus) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE sessions SET status = ?1, updated_ms = ?2 WHERE id = ?3",
+            params![status.as_str(), now, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn request_cancel(&self, session_id: &str, reason: &str) -> Result<()> {
+        self.load_session(session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        self.append_event(
+            session_id,
+            "session.cancel_requested",
+            serde_json::json!({ "reason": reason }),
+        )?;
+        self.append_event(
+            session_id,
+            "session.cancelled",
+            serde_json::json!({ "reason": reason }),
+        )?;
+        Ok(())
+    }
+
+    pub fn append_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<EventRecord> {
+        self.append_event_with_identity(
+            session_id,
+            Uuid::new_v4().simple().to_string(),
+            now_ms(),
+            event_type,
+            payload,
+        )
+    }
+
+    pub fn append_event_with_identity(
+        &self,
+        session_id: &str,
+        event_id: String,
+        ts_ms: i64,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<EventRecord> {
+        let payload_json = serde_json::to_string(&payload)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO events(id, session_id, ts_ms, type, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![event_id, session_id, ts_ms, event_type, payload_json],
+        )?;
+        let seq = tx.last_insert_rowid();
+        if let Some(status) = status_for_event(event_type, &payload) {
+            tx.execute(
+                "UPDATE sessions SET status = ?1, updated_ms = ?2 WHERE id = ?3",
+                params![status.as_str(), ts_ms, session_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE sessions SET updated_ms = ?1 WHERE id = ?2",
+                params![ts_ms, session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(EventRecord {
+            seq,
+            id: event_id,
+            session_id: session_id.to_string(),
+            ts_ms,
+            event_type: event_type.to_string(),
+            payload,
+        })
+    }
+
+    pub fn load_session(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        self.conn
+            .query_row(
+                "SELECT id, parent_id, cwd, artifact_root, status, created_ms, updated_ms FROM sessions WHERE id = ?1",
+                params![session_id],
+                row_to_session,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, cwd, artifact_root, status, created_ms, updated_ms FROM sessions ORDER BY updated_ms DESC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_session)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn events_for_session(&self, session_id: &str) -> Result<Vec<EventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, id, session_id, ts_ms, type, payload_json FROM events WHERE session_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], row_to_event)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn events_after_seq(&self, session_id: &str, after_seq: i64) -> Result<Vec<EventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, id, session_id, ts_ms, type, payload_json FROM events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, after_seq], row_to_event)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn wait_for_events_after_seq(
+        &self,
+        session_id: &str,
+        after_seq: i64,
+        timeout: Duration,
+    ) -> Result<Vec<EventRecord>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let events = self.events_after_seq(session_id, after_seq)?;
+            if !events.is_empty() || Instant::now() >= deadline {
+                return Ok(events);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn record_artifact(
+        &self,
+        session_id: &str,
+        event_seq: Option<i64>,
+        kind: &str,
+        path: impl AsRef<Path>,
+        mime: Option<&str>,
+        metadata: Value,
+    ) -> Result<ArtifactMeta> {
+        self.load_session(session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        let id = Uuid::new_v4().simple().to_string();
+        let path = path.as_ref().display().to_string();
+        let bytes = std::fs::metadata(&path)
+            .ok()
+            .and_then(|metadata| i64::try_from(metadata.len()).ok());
+        let created_ms = now_ms();
+        self.conn.execute(
+            "INSERT INTO artifacts(id, session_id, event_seq, kind, path, mime, bytes, created_ms, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                session_id,
+                event_seq,
+                kind,
+                path,
+                mime,
+                bytes,
+                created_ms,
+                serde_json::to_string(&metadata)?
+            ],
+        )?;
+        Ok(ArtifactMeta {
+            id,
+            session_id: session_id.to_string(),
+            event_seq,
+            kind: kind.to_string(),
+            path,
+            mime: mime.map(ToOwned::to_owned),
+            bytes,
+            created_ms,
+        })
+    }
+
+    pub fn artifacts_for_session(&self, session_id: &str) -> Result<Vec<ArtifactMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, event_seq, kind, path, mime, bytes, created_ms FROM artifacts WHERE session_id = ?1 ORDER BY created_ms ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], row_to_artifact)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_run_started(&self, session_id: &str, pid: Option<i64>) -> Result<String> {
+        self.load_session(session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        let id = Uuid::new_v4().simple().to_string();
+        self.conn.execute(
+            "INSERT INTO runs(id, session_id, pid, status, started_ms, ended_ms) VALUES (?1, ?2, ?3, 'running', ?4, NULL)",
+            params![id, session_id, pid, now_ms()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn finish_run(&self, run_id: &str, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET status = ?1, ended_ms = ?2 WHERE id = ?3",
+            params![status, now_ms(), run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn runs_for_session(&self, session_id: &str) -> Result<Vec<RunSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, pid, status, started_ms, ended_ms FROM runs WHERE session_id = ?1 ORDER BY started_ms ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], row_to_run_summary)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_child_agents(&self, parent_session_id: &str) -> Result<Vec<AgentSummary>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                e.parent_session_id,
+                e.child_session_id,
+                e.status,
+                s.agent_path,
+                s.agent_nickname,
+                s.agent_role,
+                e.updated_ms
+            FROM agent_edges e
+            JOIN sessions s ON s.id = e.child_session_id
+            WHERE e.parent_session_id = ?1
+            ORDER BY e.updated_ms DESC, e.child_session_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![parent_session_id], row_to_agent_summary)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn close_child_agent(&self, child_session_id: &str, reason: &str) -> Result<()> {
+        self.load_session(child_session_id)?
+            .with_context(|| format!("unknown child session id: {child_session_id}"))?;
+        let mut to_close = vec![child_session_id.to_string()];
+        self.collect_descendant_agent_ids(child_session_id, &mut to_close)?;
+        for id in to_close.into_iter().rev() {
+            let now = now_ms();
+            self.conn.execute(
+                "UPDATE agent_edges SET status = 'closed', updated_ms = ?1 WHERE child_session_id = ?2",
+                params![now, id],
+            )?;
+            self.request_cancel(&id, reason)?;
+        }
+        Ok(())
+    }
+
+    fn collect_descendant_agent_ids(
+        &self,
+        parent_session_id: &str,
+        out: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT child_session_id FROM agent_edges WHERE parent_session_id = ?1")?;
+        let children = stmt
+            .query_map(params![parent_session_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for child in children {
+            out.push(child.clone());
+            self.collect_descendant_agent_ids(&child, out)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_child_agent_status(&self, child_session_id: &str, status: &str) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE agent_edges SET status = ?1, updated_ms = ?2 WHERE child_session_id = ?3",
+            params![status, now, child_session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn send_agent_message(
+        &self,
+        author_session_id: &str,
+        target_session_id: &str,
+        content: &str,
+        trigger_turn: bool,
+    ) -> Result<AgentMessage> {
+        self.load_session(author_session_id)?
+            .with_context(|| format!("unknown author session id: {author_session_id}"))?;
+        self.load_session(target_session_id)?
+            .with_context(|| format!("unknown target session id: {target_session_id}"))?;
+        let message = AgentMessage {
+            id: Uuid::new_v4().simple().to_string(),
+            author_session_id: author_session_id.to_string(),
+            target_session_id: target_session_id.to_string(),
+            content: content.to_string(),
+            trigger_turn,
+            created_ms: now_ms(),
+        };
+        self.conn.execute(
+            "INSERT INTO agent_messages(id, author_session_id, target_session_id, content, trigger_turn, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message.id,
+                message.author_session_id,
+                message.target_session_id,
+                message.content,
+                if message.trigger_turn { 1 } else { 0 },
+                message.created_ms,
+            ],
+        )?;
+        Ok(message)
+    }
+
+    pub fn messages_for_agent(&self, target_session_id: &str) -> Result<Vec<AgentMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, author_session_id, target_session_id, content, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 ORDER BY created_ms ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![target_session_id], row_to_agent_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO app_settings(key, value, updated_ms)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_ms = excluded.updated_ms
+            "#,
+            params![key, value, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    pub fn list_settings(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM app_settings ORDER BY key ASC")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn export_legacy_session(
+        &self,
+        session_id: &str,
+        output_dir: impl AsRef<Path>,
+    ) -> Result<()> {
+        let session = self
+            .load_session(session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        let output_dir = output_dir.as_ref();
+        std::fs::create_dir_all(output_dir)
+            .with_context(|| format!("create export dir {}", output_dir.display()))?;
+        let session_json = serde_json::json!({
+            "id": session.id,
+            "parent_id": session.parent_id,
+            "state_dir": self.state_dir.display().to_string(),
+            "artifact_dir": session.artifact_root,
+            "cwd": session.cwd,
+            "status": session.status.as_str(),
+            "created_ms": session.created_ms,
+            "updated_ms": session.updated_ms,
+        });
+        std::fs::write(
+            output_dir.join("session.json"),
+            format!("{}\n", serde_json::to_string_pretty(&session_json)?),
+        )
+        .with_context(|| format!("write {}", output_dir.join("session.json").display()))?;
+
+        let file = File::create(output_dir.join("events.jsonl"))
+            .with_context(|| format!("write {}", output_dir.join("events.jsonl").display()))?;
+        let mut writer = BufWriter::new(file);
+        for event in self.events_for_session(session_id)? {
+            let line = serde_json::json!({
+                "version": 1,
+                "id": event.id,
+                "ts_ms": event.ts_ms,
+                "type": event.event_type,
+                "session_id": event.session_id,
+                "payload": event.payload,
+            });
+            writeln!(writer, "{}", serde_json::to_string(&line)?)?;
+        }
+        Ok(())
+    }
+
+    pub fn import_legacy_session(&self, input: impl AsRef<Path>) -> Result<SessionMeta> {
+        let input = input.as_ref();
+        let session_json_path = if input.is_dir() {
+            input.join("session.json")
+        } else {
+            input.with_file_name("session.json")
+        };
+        let events_jsonl_path = if input.is_dir() {
+            input.join("events.jsonl")
+        } else {
+            input.to_path_buf()
+        };
+        if !events_jsonl_path.exists() {
+            bail!("events jsonl not found: {}", events_jsonl_path.display());
+        }
+
+        let events = read_legacy_events(&events_jsonl_path)?;
+        let metadata_json = if session_json_path.exists() {
+            Some(read_json(&session_json_path)?)
+        } else {
+            None
+        };
+        let session_id = metadata_json
+            .as_ref()
+            .and_then(|data| data.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| events.first().map(|event| event.session_id.clone()))
+            .context("could not infer session id from import")?;
+        if self.load_session(&session_id)?.is_some() {
+            bail!("session already exists: {session_id}");
+        }
+
+        let now = now_ms();
+        let artifact_root = metadata_json
+            .as_ref()
+            .and_then(|data| data.get("artifact_dir"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                self.state_dir
+                    .join("artifacts")
+                    .join(&session_id)
+                    .display()
+                    .to_string()
+            });
+        std::fs::create_dir_all(&artifact_root)
+            .with_context(|| format!("create artifact root {artifact_root}"))?;
+
+        let status = metadata_json
+            .as_ref()
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("created")
+            .parse::<SessionStatus>()
+            .unwrap_or(SessionStatus::Created);
+        let session = SessionMeta {
+            id: session_id.clone(),
+            parent_id: metadata_json
+                .as_ref()
+                .and_then(|data| data.get("parent_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            cwd: metadata_json
+                .as_ref()
+                .and_then(|data| data.get("cwd"))
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_string(),
+            artifact_root,
+            status,
+            created_ms: metadata_json
+                .as_ref()
+                .and_then(|data| data.get("created_ms"))
+                .and_then(Value::as_i64)
+                .or_else(|| events.first().map(|event| event.ts_ms))
+                .unwrap_or(now),
+            updated_ms: metadata_json
+                .as_ref()
+                .and_then(|data| data.get("updated_ms"))
+                .and_then(Value::as_i64)
+                .or_else(|| events.last().map(|event| event.ts_ms))
+                .unwrap_or(now),
+        };
+        self.insert_session(&session)?;
+        for event in events {
+            self.append_event_with_identity(
+                &session_id,
+                event.id,
+                event.ts_ms,
+                &event.event_type,
+                event.payload,
+            )?;
+        }
+        self.load_session(&session_id)?
+            .context("imported session was not readable")
+    }
+
+    fn insert_session(&self, session: &SessionMeta) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions(id, parent_id, cwd, artifact_root, status, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session.id,
+                session.parent_id,
+                session.cwd,
+                session.artifact_root,
+                session.status.as_str(),
+                session.created_ms,
+                session.updated_ms
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
+    let status: String = row.get(4)?;
+    Ok(SessionMeta {
+        id: row.get(0)?,
+        parent_id: row.get(1)?,
+        cwd: row.get(2)?,
+        artifact_root: row.get(3)?,
+        status: SessionStatus::from_str(&status).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        })?,
+        created_ms: row.get(5)?,
+        updated_ms: row.get(6)?,
+    })
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let payload_json: String = row.get(5)?;
+    let payload = serde_json::from_str(&payload_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(EventRecord {
+        seq: row.get(0)?,
+        id: row.get(1)?,
+        session_id: row.get(2)?,
+        ts_ms: row.get(3)?,
+        event_type: row.get(4)?,
+        payload,
+    })
+}
+
+fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactMeta> {
+    Ok(ArtifactMeta {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        event_seq: row.get(2)?,
+        kind: row.get(3)?,
+        path: row.get(4)?,
+        mime: row.get(5)?,
+        bytes: row.get(6)?,
+        created_ms: row.get(7)?,
+    })
+}
+
+fn row_to_agent_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
+    Ok(AgentSummary {
+        parent_session_id: row.get(0)?,
+        child_session_id: row.get(1)?,
+        status: row.get(2)?,
+        agent_path: row.get(3)?,
+        agent_nickname: row.get(4)?,
+        agent_role: row.get(5)?,
+        updated_ms: row.get(6)?,
+    })
+}
+
+fn row_to_agent_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentMessage> {
+    let trigger_turn: i64 = row.get(4)?;
+    Ok(AgentMessage {
+        id: row.get(0)?,
+        author_session_id: row.get(1)?,
+        target_session_id: row.get(2)?,
+        content: row.get(3)?,
+        trigger_turn: trigger_turn != 0,
+        created_ms: row.get(5)?,
+    })
+}
+
+fn row_to_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
+    Ok(RunSummary {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        pid: row.get(2)?,
+        status: row.get(3)?,
+        started_ms: row.get(4)?,
+        ended_ms: row.get(5)?,
+    })
+}
+
+fn status_for_event(event_type: &str, payload: &Value) -> Option<SessionStatus> {
+    match event_type {
+        "session.input" => Some(SessionStatus::Running),
+        "session.done" => Some(SessionStatus::Done),
+        "session.failed" => Some(SessionStatus::Failed),
+        "session.cancelled" => Some(SessionStatus::Cancelled),
+        "session.status" => payload
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(|status| SessionStatus::from_str(status).ok()),
+        _ => None,
+    }
+}
+
+pub fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn read_json(path: &Path) -> Result<Value> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))
+}
+
+fn read_legacy_events(path: &Path) -> Result<Vec<EventRecord>> {
+    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", idx + 1, path.display()))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let data: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse line {} from {}", idx + 1, path.display()))?;
+        events.push(EventRecord {
+            seq: (idx + 1) as i64,
+            id: data
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+            session_id: data
+                .get("session_id")
+                .and_then(Value::as_str)
+                .context("legacy event missing session_id")?
+                .to_string(),
+            ts_ms: data
+                .get("ts_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(now_ms),
+            event_type: data
+                .get("type")
+                .and_then(Value::as_str)
+                .context("legacy event missing type")?
+                .to_string(),
+            payload: data
+                .get("payload")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default())),
+        });
+    }
+    Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_sessions_and_appends_events_in_sqlite() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "open example"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "complete"}),
+        )?;
+
+        let sessions = store.list_sessions()?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Done);
+        let events = store.events_for_session(&session.id)?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].event_type, "session.input");
+        assert_eq!(events[2].payload["result"], "complete");
+        Ok(())
+    }
+
+    #[test]
+    fn can_read_and_wait_for_events_after_seq() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        let first = store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "start"}),
+        )?;
+        assert!(store.events_after_seq(&session.id, first.seq)?.is_empty());
+        let second = store.append_event(
+            &session.id,
+            "model.delta",
+            serde_json::json!({"text": "working"}),
+        )?;
+        let events = store.events_after_seq(&session.id, first.seq)?;
+        assert_eq!(events, vec![second.clone()]);
+        let waited =
+            store.wait_for_events_after_seq(&session.id, first.seq, Duration::from_millis(1))?;
+        assert_eq!(waited, vec![second]);
+        Ok(())
+    }
+
+    #[test]
+    fn request_cancel_records_events_and_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "open example"}),
+        )?;
+        store.request_cancel(&session.id, "test stop")?;
+
+        let session = store.load_session(&session.id)?.expect("session");
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        let events = store.events_for_session(&session.id)?;
+        assert_eq!(events[2].event_type, "session.cancel_requested");
+        assert_eq!(events[3].event_type, "session.cancelled");
+        Ok(())
+    }
+
+    #[test]
+    fn exports_and_imports_legacy_session_shape() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let source_store = Store::open(source.path())?;
+        let session = source_store.create_session(None, "/tmp")?;
+        source_store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "find flights"}),
+        )?;
+        source_store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "found"}),
+        )?;
+
+        let export_dir = tempfile::tempdir()?;
+        source_store.export_legacy_session(&session.id, export_dir.path())?;
+        assert!(export_dir.path().join("session.json").exists());
+        assert!(export_dir.path().join("events.jsonl").exists());
+
+        let imported = tempfile::tempdir()?;
+        let imported_store = Store::open(imported.path())?;
+        let imported_session = imported_store.import_legacy_session(export_dir.path())?;
+        assert_eq!(imported_session.id, session.id);
+        assert_eq!(imported_session.status, SessionStatus::Done);
+        let events = imported_store.events_for_session(&session.id)?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].payload["text"], "find flights");
+        assert_eq!(events[2].payload["result"], "found");
+        Ok(())
+    }
+
+    #[test]
+    fn records_artifact_index_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        let file_path = temp.path().join("example.txt");
+        std::fs::write(&file_path, "hello")?;
+        let event = store.append_event(
+            &session.id,
+            "artifact.created",
+            serde_json::json!({"path": file_path.display().to_string()}),
+        )?;
+        let artifact = store.record_artifact(
+            &session.id,
+            Some(event.seq),
+            "file",
+            &file_path,
+            Some("text/plain"),
+            serde_json::json!({"label": "example"}),
+        )?;
+        assert_eq!(artifact.bytes, Some(5));
+        let artifacts = store.artifacts_for_session(&session.id)?;
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, artifact.id);
+        assert_eq!(artifacts[0].event_seq, Some(event.seq));
+        Ok(())
+    }
+
+    #[test]
+    fn records_run_lifecycle_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        let run_id = store.record_run_started(&session.id, Some(1234))?;
+        let runs = store.runs_for_session(&session.id)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run_id);
+        assert_eq!(runs[0].pid, Some(1234));
+        assert_eq!(runs[0].status, "running");
+        assert_eq!(runs[0].ended_ms, None);
+        store.finish_run(&run_id, "done")?;
+        let runs = store.runs_for_session(&session.id)?;
+        assert_eq!(runs[0].status, "done");
+        assert!(runs[0].ended_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn creates_lists_and_closes_child_agents() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, "/tmp")?;
+        let child = store.create_child_session(
+            &parent.id,
+            "/tmp",
+            Some("/root/research"),
+            Some("research"),
+            Some("explorer"),
+        )?;
+        let grandchild = store.create_child_session(
+            &child.id,
+            "/tmp",
+            Some("/root/research/detail"),
+            Some("detail"),
+            Some("explorer"),
+        )?;
+        let agents = store.list_child_agents(&parent.id)?;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].child_session_id, child.id);
+        assert_eq!(agents[0].agent_path.as_deref(), Some("/root/research"));
+        assert_eq!(agents[0].status, "open");
+
+        store.close_child_agent(&child.id, "test close")?;
+        let agents = store.list_child_agents(&parent.id)?;
+        assert_eq!(agents[0].status, "closed");
+        let child = store.load_session(&child.id)?.expect("child");
+        assert_eq!(child.status, SessionStatus::Cancelled);
+        let grandchild = store.load_session(&grandchild.id)?.expect("grandchild");
+        assert_eq!(grandchild.status, SessionStatus::Cancelled);
+        let descendants = store.list_child_agents(&child.id)?;
+        assert_eq!(descendants[0].status, "closed");
+        Ok(())
+    }
+
+    #[test]
+    fn updates_child_agent_status_without_copying_child_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, "/tmp")?;
+        let child = store.create_child_session(
+            &parent.id,
+            "/tmp",
+            Some("/root/research"),
+            Some("research"),
+            Some("explorer"),
+        )?;
+        store.set_child_agent_status(&child.id, "done")?;
+        let agents = store.list_child_agents(&parent.id)?;
+        assert_eq!(agents[0].status, "done");
+        assert!(
+            store.events_for_session(&parent.id)?.is_empty()
+                || store.events_for_session(&parent.id)?.len() == 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sends_and_lists_agent_messages() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, "/tmp")?;
+        let child = store.create_child_session(
+            &parent.id,
+            "/tmp",
+            Some("/root/research"),
+            Some("research"),
+            Some("explorer"),
+        )?;
+        let message =
+            store.send_agent_message(&parent.id, &child.id, "please inspect docs", true)?;
+        let messages = store.messages_for_agent(&child.id)?;
+        assert_eq!(messages, vec![message]);
+        assert!(messages[0].trigger_turn);
+        Ok(())
+    }
+
+    #[test]
+    fn persists_app_settings_in_sqlite() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        assert_eq!(store.get_setting("setup.complete")?, None);
+        store.set_setting("setup.complete", "1")?;
+        assert_eq!(store.get_setting("setup.complete")?.as_deref(), Some("1"));
+        store.delete_setting("setup.complete")?;
+        assert_eq!(store.get_setting("setup.complete")?, None);
+        store.set_setting("setup.complete", "1")?;
+        assert_eq!(
+            store.list_settings()?,
+            vec![("setup.complete".to_string(), "1".to_string())]
+        );
+        Ok(())
+    }
+}

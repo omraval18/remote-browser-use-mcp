@@ -1,0 +1,17 @@
+[package]
+name = "browser-use-store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+browser-use-protocol = { path = "../browser-use-protocol" }
+chrono.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

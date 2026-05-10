@@ -1,0 +1,16 @@
+[package]
+name = "browser-use-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+browser-use-core = { path = "../browser-use-core" }
+browser-use-providers = { path = "../browser-use-providers" }
+browser-use-protocol = { path = "../browser-use-protocol" }
+browser-use-python-worker = { path = "../browser-use-python-worker" }
+browser-use-store = { path = "../browser-use-store" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

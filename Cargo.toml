@@ -1,0 +1,30 @@
+[workspace]
+members = [
+  "crates/browser-use-cli",
+  "crates/browser-use-core",
+  "crates/browser-use-providers",
+  "crates/browser-use-python-worker",
+  "crates/browser-use-protocol",
+  "crates/browser-use-store",
+  "crates/browser-use-tui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

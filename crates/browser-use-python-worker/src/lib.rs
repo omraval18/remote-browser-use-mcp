@@ -1,0 +1,546 @@
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub struct PythonWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RunPythonRequest {
+    id: String,
+    session_id: String,
+    cwd: String,
+    artifact_dir: String,
+    code: String,
+    cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RunPythonResponse {
+    pub id: String,
+    pub ok: bool,
+    pub text: String,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub data: Value,
+    #[serde(default)]
+    pub outputs: Vec<Value>,
+    #[serde(default)]
+    pub artifacts: Vec<Value>,
+    #[serde(default)]
+    pub images: Vec<Value>,
+    #[serde(default)]
+    pub browser_events: Vec<Value>,
+    #[serde(default)]
+    pub browser_harness_available: bool,
+    #[serde(default)]
+    pub browser_harness_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct PythonWorkerEvent {
+    pub id: String,
+    pub event: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+impl PythonWorker {
+    pub fn start() -> Result<Self> {
+        Self::start_with_browser_mode(None)
+    }
+
+    pub fn start_with_browser_mode(browser_mode: Option<&str>) -> Result<Self> {
+        let cwd = std::env::current_dir()?;
+        let mut paths = Vec::new();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?;
+        let workspace_python = repo_root.join("python");
+        if workspace_python.exists() {
+            paths.push(workspace_python);
+        }
+        let workspace_src = repo_root.join("src");
+        if workspace_src.exists() {
+            paths.push(workspace_src);
+        }
+        let cwd_src = cwd.join("src");
+        if cwd_src.exists() {
+            paths.push(cwd_src);
+        }
+        if let Some(path) = std::env::var_os("BROWSER_HARNESS_SRC") {
+            paths.push(path.into());
+        }
+        let local_harness = Path::new("/Users/greg/Developer/browser-harness/src");
+        if local_harness.exists() {
+            paths.push(local_harness.to_path_buf());
+        }
+        if let Some(path) = std::env::var_os("PYTHONPATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        let pythonpath = std::env::join_paths(paths)?;
+        Self::start_with_default_runtime(pythonpath, browser_mode)
+    }
+
+    fn start_with_default_runtime(
+        pythonpath: impl AsRef<OsStr>,
+        browser_mode: Option<&str>,
+    ) -> Result<Self> {
+        if std::env::var_os("LLM_BROWSER_PYTHON_WORKER_DIRECT").is_none() {
+            let uv = PathBuf::from("uv");
+            let args = [
+                "run",
+                "--quiet",
+                "--with",
+                "cdp-use==1.4.5",
+                "--with",
+                "fetch-use==0.4.0",
+                "--with",
+                "pillow==12.2.0",
+                "--with",
+                "websockets==15.0.1",
+                "python",
+            ];
+            if let Ok(worker) =
+                Self::start_with_program_args(&uv, &args, pythonpath.as_ref(), browser_mode)
+            {
+                return Ok(worker);
+            }
+        }
+        Self::start_with_program_args(Path::new("python3"), &[], pythonpath.as_ref(), browser_mode)
+    }
+
+    pub fn start_with_pythonpath(
+        python: impl AsRef<Path>,
+        pythonpath: impl AsRef<OsStr>,
+    ) -> Result<Self> {
+        Self::start_with_program_args(python.as_ref(), &[], pythonpath.as_ref(), None)
+    }
+
+    fn start_with_program_args(
+        program: &Path,
+        args: &[&str],
+        pythonpath: &OsStr,
+        browser_mode: Option<&str>,
+    ) -> Result<Self> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .arg("-m")
+            .arg("llm_browser_worker.worker")
+            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONPATH", pythonpath);
+        if let Some(browser_mode) = browser_mode.filter(|mode| !mode.trim().is_empty()) {
+            command.env("LLM_BROWSER_BROWSER_MODE", browser_mode);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "start python worker via {} with PYTHONPATH={}",
+                    program.display(),
+                    pythonpath.to_string_lossy()
+                )
+            })?;
+        let stdin = child.stdin.take().context("python worker stdin missing")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("python worker stdout missing")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+        })
+    }
+
+    pub fn run(
+        &mut self,
+        session_id: &str,
+        cwd: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+        code: &str,
+    ) -> Result<RunPythonResponse> {
+        self.run_with_events(session_id, cwd, artifact_dir, code, |_| {})
+    }
+
+    pub fn run_with_events(
+        &mut self,
+        session_id: &str,
+        cwd: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+        code: &str,
+        mut on_event: impl FnMut(PythonWorkerEvent),
+    ) -> Result<RunPythonResponse> {
+        let request = RunPythonRequest {
+            id: format!("py-{}", self.next_id),
+            session_id: session_id.to_string(),
+            cwd: cwd.as_ref().display().to_string(),
+            artifact_dir: artifact_dir.as_ref().display().to_string(),
+            code: code.to_string(),
+            cancel_requested: false,
+        };
+        self.next_id += 1;
+        let line = serde_json::to_string(&request)?;
+        writeln!(self.stdin, "{line}")?;
+        self.stdin.flush()?;
+
+        loop {
+            let mut response = String::new();
+            let bytes = self.stdout.read_line(&mut response)?;
+            if bytes == 0 {
+                bail!("python worker exited before responding");
+            }
+            let value: Value =
+                serde_json::from_str(response.trim()).context("parse python worker line")?;
+            if value.get("event").is_some() {
+                let event: PythonWorkerEvent =
+                    serde_json::from_value(value).context("parse python worker event")?;
+                if event.id == request.id {
+                    on_event(event);
+                }
+                continue;
+            }
+            return serde_json::from_value(value).context("parse python worker response");
+        }
+    }
+}
+
+impl Drop for PythonWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn worker_keeps_a_persistent_namespace_per_session() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", repo_root.join("python"))?;
+        let first = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "x = 41\nprint('ready')",
+        )?;
+        assert!(first.ok, "{first:?}");
+        assert!(first.text.contains("ready"));
+
+        let second = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "print(x + 1)\nresult = {'value': x + 1}",
+        )?;
+        assert!(second.ok, "{second:?}");
+        assert!(second.text.contains("42"));
+        assert_eq!(second.data["value"], 42);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_host_helpers_collect_outputs_artifacts_and_images() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input.txt");
+        std::fs::write(&input, "hello")?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", repo_root.join("python"))?;
+        let response = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "emit_output('chunk')\ncopy_artifact('input.txt', kind='file')\nemit_browser_live_url('https://live.example')\nresult = {'ok': True}",
+        )?;
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.outputs[0]["text"], "chunk");
+        assert_eq!(response.artifacts[0]["kind"], "file");
+        assert_eq!(response.browser_events[0]["type"], "browser.live_url");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_exposes_session_metadata_and_artifact_root_helpers() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let artifact_dir = temp.path().join("artifacts");
+        let mut worker = PythonWorker::start_with_pythonpath("python3", repo_root.join("python"))?;
+        let response = worker.run(
+            "s1",
+            temp.path(),
+            &artifact_dir,
+            "result = {'root': artifact_root(), 'metadata': session_metadata()}",
+        )?;
+        assert!(response.ok, "{response:?}");
+        let artifact_dir = artifact_dir.canonicalize()?;
+        assert_eq!(response.data["root"], artifact_dir.display().to_string());
+        assert_eq!(response.data["metadata"]["session_id"], "s1");
+        assert_eq!(
+            response.data["metadata"]["artifact_root"],
+            artifact_dir.display().to_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_streams_host_helper_events_before_final_response() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", repo_root.join("python"))?;
+        let mut events = Vec::new();
+        let response = worker.run_with_events(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "emit_output('first')\nemit_browser_state(url='https://example.com')\nresult = 'done'",
+            |event| events.push(event),
+        )?;
+        assert!(response.ok, "{response:?}");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "output");
+        assert_eq!(events[0].payload["text"], "first");
+        assert_eq!(events[1].event, "browser");
+        assert_eq!(events[1].payload["type"], "browser.state");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_lazily_ensures_browser_harness_and_emits_current_tab_state() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let fake_harness = temp.path().join("browser_harness");
+        std::fs::create_dir_all(&fake_harness)?;
+        std::fs::write(fake_harness.join("__init__.py"), "")?;
+        std::fs::write(
+            fake_harness.join("admin.py"),
+            r#"
+started = False
+
+def ensure_daemon():
+    global started
+    started = True
+
+def daemon_alive():
+    return started
+"#,
+        )?;
+        std::fs::write(
+            fake_harness.join("helpers.py"),
+            r#"
+__all__ = ["cdp", "goto_url", "current_tab"]
+
+def cdp(method, session_id=None, **params):
+    from browser_harness import admin
+    if not admin.started:
+        raise RuntimeError("daemon was not ensured")
+    return {"method": method, "params": params, "session_id": session_id}
+
+def goto_url(url):
+    return cdp("Page.navigate", url=url)
+
+def current_tab():
+    return {"targetId": "target-1", "url": "https://example.com", "title": "Example Domain"}
+"#,
+        )?;
+        let pythonpath =
+            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
+        let mut events = Vec::new();
+        let response = worker.run_with_events(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "result = goto_url('https://example.com')",
+            |event| events.push(event),
+        )?;
+        assert!(response.ok, "{response:?}");
+        assert!(response.browser_harness_available);
+        assert_eq!(response.data["method"], "Page.navigate");
+        assert_eq!(response.browser_events[0]["type"], "browser.state");
+        assert_eq!(
+            response.browser_events[0]["payload"]["url"],
+            "https://example.com"
+        );
+        assert!(events.iter().any(|event| event.event == "browser"
+            && event.payload["payload"]["title"] == "Example Domain"));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_can_index_browser_harness_download_outputs() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let fake_harness = temp.path().join("browser_harness");
+        std::fs::create_dir_all(&fake_harness)?;
+        std::fs::write(fake_harness.join("__init__.py"), "")?;
+        std::fs::write(
+            fake_harness.join("admin.py"),
+            r#"
+started = False
+
+def ensure_daemon():
+    global started
+    started = True
+
+def daemon_alive():
+    return started
+"#,
+        )?;
+        std::fs::write(
+            fake_harness.join("helpers.py"),
+            r#"
+import os
+from pathlib import Path
+
+__all__ = ["cdp", "download_file", "current_tab"]
+
+def cdp(method, session_id=None, **params):
+    from browser_harness import admin
+    if not admin.started:
+        raise RuntimeError("daemon was not ensured")
+    return {"method": method, "params": params, "session_id": session_id}
+
+def download_file(name):
+    cdp("Browser.downloadWillBegin", suggestedFilename=name)
+    path = Path(os.getcwd()) / name
+    path.write_text("downloaded", encoding="utf-8")
+    return str(path)
+
+def current_tab():
+    return {"targetId": "target-download", "url": "https://example.com/download", "title": "Download"}
+"#,
+        )?;
+        let pythonpath =
+            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
+        let response = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "path = download_file('report.csv')\ncopy_artifact(path, kind='file')\nresult = {'download': path}",
+        )?;
+        assert!(response.ok, "{response:?}");
+        assert!(response.browser_harness_available);
+        assert_eq!(response.artifacts[0]["kind"], "file");
+        assert_eq!(response.artifacts[0]["bytes"], 10);
+        assert_eq!(
+            response.browser_events[0]["payload"]["target_id"],
+            "target-download"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_refreshes_browser_identity_from_harness_each_call() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let fake_harness = temp.path().join("browser_harness");
+        std::fs::create_dir_all(&fake_harness)?;
+        std::fs::write(fake_harness.join("__init__.py"), "")?;
+        std::fs::write(
+            fake_harness.join("admin.py"),
+            r#"
+started = False
+
+def ensure_daemon():
+    global started
+    started = True
+
+def daemon_alive():
+    return started
+"#,
+        )?;
+        std::fs::write(
+            fake_harness.join("helpers.py"),
+            r#"
+__all__ = ["cdp", "goto_url", "current_tab"]
+count = 0
+
+def cdp(method, session_id=None, **params):
+    from browser_harness import admin
+    if not admin.started:
+        raise RuntimeError("daemon was not ensured")
+    return {"method": method, "params": params, "session_id": session_id}
+
+def goto_url(url):
+    return cdp("Page.navigate", url=url)
+
+def current_tab():
+    global count
+    count += 1
+    return {"targetId": f"target-{count}", "url": f"https://example.com/{count}", "title": f"Page {count}"}
+"#,
+        )?;
+        let pythonpath =
+            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
+        let first = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "result = goto_url('https://example.com/first')",
+        )?;
+        let second = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "result = goto_url('https://example.com/second')",
+        )?;
+        assert!(first.ok, "{first:?}");
+        assert!(second.ok, "{second:?}");
+        assert_eq!(first.browser_events[0]["payload"]["target_id"], "target-1");
+        assert_eq!(second.browser_events[0]["payload"]["target_id"], "target-2");
+        assert_eq!(
+            second.browser_events[0]["payload"]["url"],
+            "https://example.com/2"
+        );
+        Ok(())
+    }
+}
