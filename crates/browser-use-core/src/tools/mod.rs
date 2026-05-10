@@ -14,8 +14,10 @@ pub(crate) enum ToolHandlerKind {
     SearchFiles,
     ListFiles,
     ViewImage,
+    UpdatePlan,
     SpawnAgent,
     WaitAgent,
+    SendInput,
     SendMessage,
     FollowupTask,
     ListAgents,
@@ -43,10 +45,12 @@ impl ToolRegistry {
         registry.register(search_files_tool_spec(), ToolHandlerKind::SearchFiles);
         registry.register(list_files_tool_spec(), ToolHandlerKind::ListFiles);
         registry.register(view_image_tool_spec(), ToolHandlerKind::ViewImage);
+        registry.register(update_plan_tool_spec(), ToolHandlerKind::UpdatePlan);
         registry.register(python_tool_spec(), ToolHandlerKind::Python);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         registry.register(spawn_agent_tool_spec(), ToolHandlerKind::SpawnAgent);
         registry.register(wait_agent_tool_spec(), ToolHandlerKind::WaitAgent);
+        registry.register(send_input_tool_spec(), ToolHandlerKind::SendInput);
         registry.register(send_message_tool_spec(), ToolHandlerKind::SendMessage);
         registry.register(followup_task_tool_spec(), ToolHandlerKind::FollowupTask);
         registry.register(list_agents_tool_spec(), ToolHandlerKind::ListAgents);
@@ -337,6 +341,45 @@ fn done_tool_spec() -> ToolSpec {
     }
 }
 
+fn update_plan_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "update_plan".to_string(),
+        description: "Update a short task plan with step statuses for long-running work."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional short explanation for the plan update."
+                },
+                "plan": {
+                    "type": "array",
+                    "description": "Ordered plan steps.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {
+                                "type": "string",
+                                "description": "Short step description."
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Current status for this step."
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn spawn_agent_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn_agent".to_string(),
@@ -398,6 +441,35 @@ fn wait_agent_tool_spec() -> ToolSpec {
                 }
             },
             "required": ["child_session_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn send_input_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "send_input".to_string(),
+        description: "Send an instruction to a helper session and wake its next turn.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "child_session_id": {
+                    "type": "string",
+                    "description": "The helper session id or canonical helper path returned by spawn_agent."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Alias for child_session_id, matching Codex-style target naming."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The instruction for the helper."
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Alias for message."
+                }
+            },
             "additionalProperties": false
         }),
     }

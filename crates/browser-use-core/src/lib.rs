@@ -814,16 +814,32 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::SearchFiles => dispatch_search_files_tool(store, session, call),
         ToolHandlerKind::ListFiles => dispatch_list_files_tool(store, session, call),
         ToolHandlerKind::ViewImage => dispatch_view_image_tool(store, session, call),
+        ToolHandlerKind::UpdatePlan => dispatch_update_plan_tool(store, session, call),
         ToolHandlerKind::SpawnAgent => {
             dispatch_spawn_agent_tool(store, provider, session, call, options)
         }
         ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call),
-        ToolHandlerKind::SendMessage => {
-            dispatch_agent_message_tool(store, provider, session, call, false, options)
+        ToolHandlerKind::SendInput => {
+            dispatch_agent_message_tool(store, provider, session, call, "send_input", true, options)
         }
-        ToolHandlerKind::FollowupTask => {
-            dispatch_agent_message_tool(store, provider, session, call, true, options)
-        }
+        ToolHandlerKind::SendMessage => dispatch_agent_message_tool(
+            store,
+            provider,
+            session,
+            call,
+            "send_message",
+            false,
+            options,
+        ),
+        ToolHandlerKind::FollowupTask => dispatch_agent_message_tool(
+            store,
+            provider,
+            session,
+            call,
+            "followup_task",
+            true,
+            options,
+        ),
         ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
     }
@@ -910,6 +926,98 @@ fn dispatch_view_image_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_content_message(call, "view_image", result.content)],
+    })
+}
+
+fn dispatch_update_plan_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let Some(plan) = call.arguments.get("plan").and_then(Value::as_array) else {
+        return dispatch_tool_validation_error(store, session, call, "update_plan requires plan");
+    };
+    let mut in_progress = 0;
+    for item in plan {
+        let step = item
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if step.is_empty() {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "update_plan plan items require step",
+            );
+        }
+        if !matches!(status, "pending" | "in_progress" | "completed") {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "update_plan statuses must be pending, in_progress, or completed",
+            );
+        }
+        if status == "in_progress" {
+            in_progress += 1;
+        }
+    }
+    if in_progress > 1 {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "update_plan allows at most one in_progress item",
+        );
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "update_plan",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let explanation = call
+        .arguments
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    store.append_event(
+        &session.id,
+        "plan.updated",
+        serde_json::json!({
+            "tool_call_id": call.id,
+            "explanation": explanation,
+            "plan": plan,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "update_plan",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            call,
+            "update_plan",
+            serde_json::json!({
+                "status": "updated",
+                "items": plan.len(),
+            }),
+        )?],
     })
 }
 
@@ -1393,17 +1501,14 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
     provider: &P,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_name: &str,
     trigger_turn: bool,
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    let tool_name = if trigger_turn {
-        "followup_task"
-    } else {
-        "send_message"
-    };
     let Some(child_ref) = call
         .arguments
         .get("child_session_id")
+        .or_else(|| call.arguments.get("target"))
         .and_then(Value::as_str)
     else {
         return dispatch_tool_validation_error(
@@ -1426,6 +1531,7 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
     let message = call
         .arguments
         .get("message")
+        .or_else(|| call.arguments.get("input"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
@@ -2402,6 +2508,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_can_update_plan() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "plan_1".to_string(),
+                        name: "update_plan".to_string(),
+                        arguments: serde_json::json!({
+                            "explanation": "starting",
+                            "plan": [
+                                { "step": "Inspect", "status": "completed" },
+                                { "step": "Patch", "status": "in_progress" },
+                                { "step": "Verify", "status": "pending" }
+                            ],
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_plan".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({"result": "planned"}),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "make a plan",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "plan.updated"
+                && event.payload["plan"][1]["status"] == "in_progress"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn provider_messages_are_compacted_when_context_gets_large() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -2595,6 +2749,10 @@ mod tests {
         assert!(parent_events
             .iter()
             .any(|event| event.event_type == "model.tool_call"
+                && event.payload["name"] == "send_input"));
+        assert!(parent_events
+            .iter()
+            .any(|event| event.event_type == "model.tool_call"
                 && event.payload["name"] == "followup_task"));
         assert!(parent_events
             .iter()
@@ -2632,12 +2790,13 @@ mod tests {
                 .filter(|event| event.event_type == "session.done"
                     && event.payload["result"] == "child inspected constraints")
                 .count(),
-            2
+            3
         );
         let mailbox = store.messages_for_agent(&children[0].child_session_id)?;
-        assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox.len(), 3);
         assert!(!mailbox[0].trigger_turn);
         assert!(mailbox[1].trigger_turn);
+        assert!(mailbox[2].trigger_turn);
         Ok(())
     }
 
@@ -2936,6 +3095,16 @@ mod tests {
                 }
                 2 => ModelEvent::ToolCall {
                     call: ToolCall {
+                        id: "send_input_1".to_string(),
+                        name: "send_input".to_string(),
+                        arguments: serde_json::json!({
+                            "target": "flight-search",
+                            "input": "run the codex-style input",
+                        }),
+                    },
+                },
+                3 => ModelEvent::ToolCall {
+                    call: ToolCall {
                         id: "followup_1".to_string(),
                         name: "followup_task".to_string(),
                         arguments: serde_json::json!({
@@ -2944,7 +3113,7 @@ mod tests {
                         }),
                     },
                 },
-                3 => ModelEvent::ToolCall {
+                4 => ModelEvent::ToolCall {
                     call: ToolCall {
                         id: "wait_1".to_string(),
                         name: "wait_agent".to_string(),
@@ -2953,14 +3122,14 @@ mod tests {
                         }),
                     },
                 },
-                4 => ModelEvent::ToolCall {
+                5 => ModelEvent::ToolCall {
                     call: ToolCall {
                         id: "list_1".to_string(),
                         name: "list_agents".to_string(),
                         arguments: serde_json::json!({"path_prefix": "/root"}),
                     },
                 },
-                5 => ModelEvent::ToolCall {
+                6 => ModelEvent::ToolCall {
                     call: ToolCall {
                         id: "close_1".to_string(),
                         name: "close_agent".to_string(),
