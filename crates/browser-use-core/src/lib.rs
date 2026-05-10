@@ -807,6 +807,8 @@ fn dispatch_tool_call<P: ModelProvider>(
             call,
             options.python_tool_timeout_seconds,
         ),
+        ToolHandlerKind::ExecCommand => dispatch_exec_command_tool(store, session, call),
+        ToolHandlerKind::WriteStdin => dispatch_write_stdin_tool(store, session, call),
         ToolHandlerKind::SpawnAgent => {
             dispatch_spawn_agent_tool(store, provider, session, call, options)
         }
@@ -820,6 +822,30 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
     }
+}
+
+fn dispatch_exec_command_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::command::exec_command(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(call, "exec_command", result.content)?],
+    })
+}
+
+fn dispatch_write_stdin_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::command::write_stdin(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(call, "write_stdin", result.content)?],
+    })
 }
 
 fn dispatch_done_tool(
@@ -2166,6 +2192,58 @@ mod tests {
         }));
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "timeout recovered"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_can_use_exec_command_tool() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "exec_1".to_string(),
+                        name: "exec_command".to_string(),
+                        arguments: serde_json::json!({
+                            "cmd": "printf codex-tool",
+                            "yield_time_ms": 5000,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_exec".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({"result": "command complete"}),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "run a command",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "command.output" && event.payload["text"] == "codex-tool"
+        }));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "command.finished"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "command complete"
         }));
         Ok(())
     }

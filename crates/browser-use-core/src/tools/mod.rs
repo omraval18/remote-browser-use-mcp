@@ -1,9 +1,13 @@
 use browser_use_protocol::ToolSpec;
 
+pub(crate) mod command;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolHandlerKind {
     Done,
     Python,
+    ExecCommand,
+    WriteStdin,
     SpawnAgent,
     WaitAgent,
     SendMessage,
@@ -26,6 +30,8 @@ pub(crate) struct ToolRegistry {
 impl ToolRegistry {
     pub(crate) fn browser_agent() -> Self {
         let mut registry = Self::default();
+        registry.register(exec_command_tool_spec(), ToolHandlerKind::ExecCommand);
+        registry.register(write_stdin_tool_spec(), ToolHandlerKind::WriteStdin);
         registry.register(python_tool_spec(), ToolHandlerKind::Python);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         registry.register(spawn_agent_tool_spec(), ToolHandlerKind::SpawnAgent);
@@ -50,6 +56,80 @@ impl ToolRegistry {
             .iter()
             .find(|tool| tool.spec.name == name)
             .map(|tool| tool.handler)
+    }
+}
+
+fn exec_command_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "exec_command".to_string(),
+        description: "Runs a command, returning output or a session ID for ongoing interaction."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "Shell command to execute."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional working directory to run the command in; defaults to the task cwd."
+                },
+                "shell": {
+                    "type": "string",
+                    "description": "Shell binary to launch. Defaults to the user's default shell."
+                },
+                "tty": {
+                    "type": "boolean",
+                    "description": "Whether to request a TTY. Currently accepted for Codex compatibility; PTY allocation is a follow-up hardening item."
+                },
+                "login": {
+                    "type": "boolean",
+                    "description": "Whether to run the shell with login semantics."
+                },
+                "yield_time_ms": {
+                    "type": "integer",
+                    "description": "How long to wait in milliseconds for output before yielding."
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "description": "Maximum number of tokens to return. Excess output will be truncated."
+                }
+            },
+            "required": ["cmd"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn write_stdin_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "write_stdin".to_string(),
+        description: "Writes characters to an existing command session and returns recent output."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Identifier of the running command session."
+                },
+                "chars": {
+                    "type": "string",
+                    "description": "Bytes to write to stdin. May be empty to poll."
+                },
+                "yield_time_ms": {
+                    "type": "integer",
+                    "description": "How long to wait in milliseconds for output before yielding."
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "description": "Maximum number of tokens to return. Excess output will be truncated."
+                }
+            },
+            "required": ["session_id"],
+            "additionalProperties": false
+        }),
     }
 }
 
