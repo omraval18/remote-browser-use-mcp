@@ -13,8 +13,8 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - Child agents are separate sessions with canonical `/root/...` paths, per-parent path uniqueness, configurable sanitized fork modes, durable graph edges, recursive close/cancel, bounded `wait_agent`, mailbox messages with author/recipient path envelopes, and provider execution isolated from the parent transcript.
 - Provider adapters exist for fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter.
 - Claude Code account selection can run Anthropic Messages through a stored or environment OAuth bearer token from `claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`.
-- CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, dataset list/sample/report, and resumable dataset runners with isolated per-case workspaces.
-- TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views. Settings, runtime launching, and theme helpers are split out of `main.rs`; the TUI no longer constructs concrete provider adapters and asks the core runtime to run a selected session from a small provider config.
+- CLI has task runners, session runners, `sessions`/`session` aliases for list/show/cancel/trace/export/import/events, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, dataset list/sample/report, and resumable dataset runners with isolated per-case workspaces.
+- TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views. Settings, runtime launching, theme helpers, and rendering are split out of `main.rs`; the TUI no longer constructs concrete provider adapters and asks the core runtime to run a selected session from a small provider config.
 - Failed tasks expose a working Enter-to-retry path, and successful retries clear old failure projections from the normal workbench.
 - Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
 - Core checks for external cancellation between provider/tool turns, avoids finalizing cancelled sessions as done, and records cancelled run rows.
@@ -40,9 +40,11 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - checked-in golden event fixture import and TUI projection tests
 - live Codex no-browser smoke with a `done` tool call
 - config/auth/diagnostics/trace CLI smoke tests
+- `sessions` / `session` CLI alias smoke tests for list, show, and trace
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction
 - stored Claude Code OAuth-token smoke for login, status, provider credential routing, and `config show` secret redaction
 - deterministic TUI dumps for the main product states
+- deterministic TUI dumps after the renderer split for setup, result, browser, and history
 - focused TUI regression for retrying a failed task from the failure screen
 - manual PTY setup, model/browser selection, task submission, result follow-up, history resume, actions/help, clear input, and quit with the hidden fake backend
 - final manual 80x24 PTY smoke with stored settings, task submission, result rendering, history overlay, browser overlay, and clean quit; evidence is in `/tmp/but-goal-final-tui`, session `5f401d3d9a4f`
