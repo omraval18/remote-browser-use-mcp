@@ -261,6 +261,18 @@ def _emit_protocol_event(request_id: str, event: str, payload: Dict[str, Any]) -
     )
 
 
+def _record_browser_event(
+    ns: Dict[str, Any],
+    request_id: str,
+    event_type: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    record = {"type": event_type, "payload": payload}
+    ns.setdefault("browser_events", []).append(record)
+    _emit_protocol_event(request_id, "browser", record)
+    return record
+
+
 def _namespace(session_id: str, cwd: Path, artifact_dir: Path) -> Dict[str, Any]:
     ns = _namespaces.setdefault(
         session_id,
@@ -345,9 +357,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         return image
 
     def emit_browser_live_url(live_url: str) -> None:
-        record = {"type": "browser.live_url", "payload": {"live_url": str(live_url)}}
-        ns.setdefault("browser_events", []).append(record)
-        _emit_protocol_event(request_id, "browser", record)
+        _record_browser_event(ns, request_id, "browser.live_url", {"live_url": str(live_url)})
 
     def emit_browser_state(
         url: str | None = None,
@@ -367,9 +377,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             payload["tabs"] = int(tabs)
         if viewport is not None:
             payload["viewport"] = viewport
-        record = {"type": "browser.state", "payload": payload}
-        ns.setdefault("browser_events", []).append(record)
-        _emit_protocol_event(request_id, "browser", record)
+        _record_browser_event(ns, request_id, "browser.state", payload)
 
     def check_cancel() -> None:
         if cancel_requested:
@@ -440,8 +448,83 @@ def _auto_emit_browser_state(ns: Dict[str, Any], request_id: str) -> None:
     record = {"type": "browser.state", "payload": payload}
     if (ns.get("browser_events") or [])[-1:] == [record]:
         return
-    ns.setdefault("browser_events", []).append(record)
-    _emit_protocol_event(request_id, "browser", record)
+    _record_browser_event(ns, request_id, "browser.state", payload)
+
+
+def _browser_connection_snapshot(ns: Dict[str, Any]) -> Dict[str, Any] | None:
+    if not ns.get("browser_harness_available"):
+        return None
+    helpers = ns.get("__browser_harness_helpers__")
+    admin = ns.get("__browser_harness_admin__")
+    if helpers is None or admin is None:
+        return None
+    send = getattr(helpers, "_send", None)
+    if send is None:
+        return None
+    try:
+        if not admin.daemon_alive():
+            return {"status": "disconnected"}
+        response = send({"meta": "connection_status"})
+    except Exception as exc:
+        return {"status": "disconnected", "error": str(exc)}
+    if response.get("error"):
+        return {"status": "disconnected", "error": str(response.get("error"))}
+    page = response.get("page") or {}
+    snapshot: Dict[str, Any] = {
+        "status": "connected",
+        "target_id": response.get("target_id"),
+        "session_id": response.get("session_id"),
+    }
+    if page.get("url"):
+        snapshot["url"] = str(page.get("url"))
+    if page.get("title"):
+        snapshot["title"] = str(page.get("title"))
+    return snapshot
+
+
+def _emit_browser_identity_events(ns: Dict[str, Any], request_id: str) -> None:
+    current = _browser_connection_snapshot(ns)
+    if current is None:
+        return
+    previous = ns.get("__browser_identity__")
+    if current.get("status") != "connected":
+        if isinstance(previous, dict) and previous.get("status") == "connected":
+            _record_browser_event(ns, request_id, "browser.disconnected", current)
+        ns["__browser_identity__"] = current
+        return
+
+    if not isinstance(previous, dict) or previous.get("status") != "connected":
+        _record_browser_event(ns, request_id, "browser.connected", current)
+        ns["__browser_identity__"] = current
+        return
+
+    previous_session = previous.get("session_id")
+    current_session = current.get("session_id")
+    previous_target = previous.get("target_id")
+    current_target = current.get("target_id")
+    if previous_session and current_session and previous_session != current_session:
+        _record_browser_event(
+            ns,
+            request_id,
+            "browser.reconnected",
+            {
+                **current,
+                "previous_session_id": previous_session,
+                "stale_object_ids": True,
+            },
+        )
+    if previous_target and current_target and previous_target != current_target:
+        _record_browser_event(
+            ns,
+            request_id,
+            "browser.target_changed",
+            {
+                **current,
+                "previous_target_id": previous_target,
+                "stale_object_ids": True,
+            },
+        )
+    ns["__browser_identity__"] = current
 
 
 def _run(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -469,6 +552,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             exec(compile(code, "<browser-use-python-worker>", "exec"), ns)
         _auto_emit_browser_state(ns, request_id)
+        _emit_browser_identity_events(ns, request_id)
         return {
             "id": request_id,
             "ok": True,
@@ -483,6 +567,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
             "browser_harness_error": ns.get("browser_harness_error"),
         }
     except BaseException as exc:
+        _emit_browser_identity_events(ns, request_id)
         return {
             "id": request_id,
             "ok": False,

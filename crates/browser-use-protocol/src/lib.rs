@@ -228,6 +228,18 @@ pub fn browser_summary_from_events(
     };
     for event in events {
         match event.event_type.as_str() {
+            "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
+                summary.status = "connected".to_string();
+                if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
+                    summary.url = Some(url.to_string());
+                }
+                if let Some(title) = event.payload.get("title").and_then(Value::as_str) {
+                    summary.title = Some(title.to_string());
+                }
+            }
+            "browser.disconnected" => {
+                summary.status = "disconnected".to_string();
+            }
             "browser.live_url" => {
                 summary.status = "connected".to_string();
                 summary.live_url = event
@@ -324,6 +336,10 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
     let mut activity = Vec::new();
     for event in events {
         match event.event_type.as_str() {
+            "browser.connected" => activity.push("browser connected".to_string()),
+            "browser.reconnected" => activity.push("browser reconnected".to_string()),
+            "browser.target_changed" => activity.push("browser target changed".to_string()),
+            "browser.disconnected" => activity.push("browser disconnected".to_string()),
             "browser.live_url" => activity.push("connected live browser".to_string()),
             "browser.page" | "browser.state" => {
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
@@ -628,6 +644,67 @@ mod tests {
                 "browsing example.com",
                 "ran cargo test -p browser-use-core",
                 "modified main.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn projects_browser_identity_events() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "browser.connected".to_string(),
+                payload: json!({
+                    "target_id": "target-1",
+                    "session_id": "session-1",
+                    "url": "https://example.com/one",
+                    "title": "One",
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "browser.reconnected".to_string(),
+                payload: json!({
+                    "target_id": "target-1",
+                    "session_id": "session-2",
+                    "previous_session_id": "session-1",
+                    "url": "https://example.com/two",
+                    "title": "Two",
+                    "stale_object_ids": true,
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "e3".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 3,
+                event_type: "browser.target_changed".to_string(),
+                payload: json!({
+                    "target_id": "target-2",
+                    "previous_target_id": "target-1",
+                    "session_id": "session-3",
+                    "url": "https://example.com/three",
+                    "title": "Three",
+                    "stale_object_ids": true,
+                }),
+            },
+        ];
+        let browser = browser_summary_from_events(&events, "browser use cloud");
+        assert_eq!(browser.status, "connected");
+        assert_eq!(browser.url.as_deref(), Some("https://example.com/three"));
+        assert_eq!(browser.title.as_deref(), Some("Three"));
+        assert_eq!(
+            activity_from_events(&events),
+            vec![
+                "browser connected",
+                "browser reconnected",
+                "browser target changed",
             ]
         );
     }

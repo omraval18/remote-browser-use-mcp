@@ -612,4 +612,113 @@ def current_tab():
         );
         Ok(())
     }
+
+    #[test]
+    fn worker_emits_explicit_browser_identity_changes() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let fake_harness = temp.path().join("browser_harness");
+        std::fs::create_dir_all(&fake_harness)?;
+        std::fs::write(fake_harness.join("__init__.py"), "")?;
+        std::fs::write(
+            fake_harness.join("admin.py"),
+            r#"
+started = False
+
+def ensure_daemon():
+    global started
+    started = True
+
+def daemon_alive():
+    return started
+"#,
+        )?;
+        std::fs::write(
+            fake_harness.join("helpers.py"),
+            r#"
+__all__ = ["cdp", "goto_url", "current_tab", "set_identity"]
+target_id = "target-1"
+session_id = "session-1"
+url = "https://example.com/one"
+title = "One"
+
+def _send(request):
+    if request.get("meta") == "connection_status":
+        return {
+            "target_id": target_id,
+            "session_id": session_id,
+            "page": {"targetId": target_id, "url": url, "title": title},
+        }
+    return {}
+
+def cdp(method, session_id=None, **params):
+    from browser_harness import admin
+    if not admin.started:
+        raise RuntimeError("daemon was not ensured")
+    return {"method": method, "params": params, "session_id": session_id}
+
+def goto_url(next_url):
+    cdp("Page.navigate", url=next_url)
+    return {"ok": True}
+
+def current_tab():
+    return {"targetId": target_id, "url": url, "title": title}
+
+def set_identity(next_target_id, next_session_id, next_url, next_title):
+    global target_id, session_id, url, title
+    target_id = next_target_id
+    session_id = next_session_id
+    url = next_url
+    title = next_title
+"#,
+        )?;
+        let pythonpath =
+            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
+
+        let first = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "result = goto_url('https://example.com/one')",
+        )?;
+        assert!(first.ok, "{first:?}");
+        assert!(first
+            .browser_events
+            .iter()
+            .any(|event| event["type"] == "browser.connected"));
+
+        let second = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "set_identity('target-1', 'session-2', 'https://example.com/two', 'Two')",
+        )?;
+        assert!(second.ok, "{second:?}");
+        assert!(second
+            .browser_events
+            .iter()
+            .any(|event| event["type"] == "browser.reconnected"
+                && event["payload"]["previous_session_id"] == "session-1"
+                && event["payload"]["stale_object_ids"] == true));
+
+        let third = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "set_identity('target-2', 'session-3', 'https://example.com/three', 'Three')",
+        )?;
+        assert!(third.ok, "{third:?}");
+        assert!(third
+            .browser_events
+            .iter()
+            .any(|event| event["type"] == "browser.target_changed"
+                && event["payload"]["previous_target_id"] == "target-1"
+                && event["payload"]["stale_object_ids"] == true));
+        Ok(())
+    }
 }
