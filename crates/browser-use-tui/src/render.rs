@@ -175,7 +175,7 @@ fn render_main(
         main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
     let mut body = body;
     if body.len() > body_area.height as usize {
-        body = visible_tail_lines(body, body_area.height);
+        body = visible_main_body_lines(body, body_area.height, product_state);
     }
     frame.render_widget(
         Paragraph::new(body)
@@ -353,13 +353,7 @@ fn native_replay_live_lines(
         ProductState::Failed => {
             let error = state.failure.as_deref().unwrap_or("The task failed.");
             let (primary, secondary) = failure_actions(error);
-            let mut lines = tool_aware_chronological_lines(app, state, width, product_state)
-                .unwrap_or_else(|| native_plain_transcript_lines(state, width, product_state));
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            append_ascii_text_block(&mut lines, "error", &[friendly_error_message(error)], None);
-            lines.push(Line::from(""));
+            let mut lines = Vec::new();
             append_ascii_lines_block(
                 &mut lines,
                 "next",
@@ -374,18 +368,7 @@ fn native_replay_live_lines(
             lines
         }
         ProductState::Cancelled => {
-            let mut lines = tool_aware_chronological_lines(app, state, width, product_state)
-                .unwrap_or_else(|| native_plain_transcript_lines(state, width, product_state));
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            append_ascii_text_block(
-                &mut lines,
-                "stopped",
-                &["Progress is saved in history.".to_string()],
-                None,
-            );
-            lines.push(Line::from(""));
+            let mut lines = Vec::new();
             append_ascii_lines_block(
                 &mut lines,
                 "next",
@@ -398,8 +381,7 @@ fn native_replay_live_lines(
             );
             lines
         }
-        ProductState::Result => tool_aware_chronological_lines(app, state, width, product_state)
-            .unwrap_or_else(|| native_plain_transcript_lines(state, width, product_state)),
+        ProductState::Result => Vec::new(),
         ProductState::Ready => Vec::new(),
         ProductState::SetupNeeded => setup_lines(app),
     };
@@ -419,6 +401,31 @@ fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'s
         lines = lines.split_off(lines.len() - height);
     }
     lines
+}
+
+fn visible_head_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
+    let height = height as usize;
+    if height == 0 {
+        return Vec::new();
+    }
+    if lines.len() > height {
+        lines.truncate(height);
+    }
+    lines
+}
+
+fn visible_main_body_lines(
+    lines: Vec<Line<'static>>,
+    height: u16,
+    product_state: ProductState,
+) -> Vec<Line<'static>> {
+    match product_state {
+        ProductState::Ready | ProductState::SetupNeeded => visible_head_lines(lines, height),
+        ProductState::Running
+        | ProductState::Result
+        | ProductState::Failed
+        | ProductState::Cancelled => visible_tail_lines(lines, height),
+    }
 }
 
 fn render_surface(
@@ -1651,6 +1658,9 @@ fn append_native_timeline_event(
 ) {
     match event.event_type.as_str() {
         "session.input" | "session.followup" => {
+            if !is_root_session_event(state, event) {
+                return;
+            }
             if let Some(prompt) = event
                 .payload
                 .get("text")
@@ -1664,6 +1674,9 @@ fn append_native_timeline_event(
             }
         }
         "session.done" => {
+            if !is_root_session_event(state, event) {
+                return;
+            }
             if let Some(result) = event
                 .payload
                 .get("result")
@@ -1676,6 +1689,9 @@ fn append_native_timeline_event(
             }
         }
         "session.failed" => {
+            if !is_root_session_event(state, event) {
+                return;
+            }
             let error = event
                 .payload
                 .get("error")
@@ -1686,6 +1702,9 @@ fn append_native_timeline_event(
             append_ascii_text_block(lines, "error", &[friendly_error_message(error)], None);
         }
         "session.cancelled" => {
+            if !is_root_session_event(state, event) {
+                return;
+            }
             last_group.take();
             push_gap_if_needed(lines);
             append_ascii_text_block(
@@ -1955,6 +1974,13 @@ fn append_native_timeline_event(
         }
         _ => {}
     }
+}
+
+fn is_root_session_event(state: &WorkbenchState, event: &EventRecord) -> bool {
+    state
+        .current_session
+        .as_ref()
+        .is_some_and(|session| session.id == event.session_id)
 }
 
 fn append_tool_call_intent(

@@ -97,7 +97,7 @@ impl Surface {
     fn is_bottom_pane(self) -> bool {
         matches!(
             self,
-            Self::Browser | Self::BrowserSelect | Self::Developer | Self::History | Self::Model
+            Self::Browser | Self::BrowserSelect | Self::Developer | Self::Model
         )
     }
 
@@ -1710,9 +1710,7 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
 }
 
 fn run_terminal(mut app: App) -> Result<()> {
-    let live_height = crossterm::terminal::size()
-        .map(|(_, height)| height.saturating_sub(1).max(12))
-        .unwrap_or_else(|_| app.live_viewport_height());
+    let live_height = app.live_viewport_height();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -1890,11 +1888,7 @@ fn maybe_emit_native_transcript(
     };
 
     let session_id = session.id.clone();
-    let session_is_active = session.status.is_active();
     let width = native_scrollback_width(size.width);
-    let terminal_height = crossterm::terminal::size()
-        .map(|(_, height)| height)
-        .unwrap_or(size.height);
 
     if !app.native_history.is_active_for(Some(&session_id)) {
         let mut last_group = None;
@@ -1906,10 +1900,6 @@ fn maybe_emit_native_transcript(
             width,
             &mut last_group,
         );
-        if !session_is_active && !should_use_native_scrollback(terminal_height, lines.len()) {
-            app.native_history.reset();
-            return Ok(());
-        }
         insert_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, last_seq, last_group);
@@ -1938,14 +1928,6 @@ fn maybe_emit_native_transcript(
 
 fn native_scrollback_width(terminal_width: u16) -> u16 {
     terminal_width.saturating_sub(4).max(1)
-}
-
-fn should_use_native_scrollback(viewport_height: u16, line_count: usize) -> bool {
-    let inline_chrome_rows = 8usize;
-    let visible_budget = (viewport_height as usize)
-        .saturating_sub(inline_chrome_rows)
-        .max(8);
-    line_count > visible_budget
 }
 
 fn clear_native_transcript_screen(
@@ -2995,6 +2977,76 @@ mod redesign_tests {
     }
 
     #[test]
+    fn native_parent_scrollback_does_not_replay_child_session_turns() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "explain this repo"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "read every repo file"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "file.read",
+            serde_json::json!({"path": "/repo/README.md"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.completed",
+            serde_json::json!({
+                "child_session_id": child.id,
+                "payload": {"result": "Short helper summary"}
+            }),
+        )?;
+        app.selected_session_id = Some(parent.id.clone());
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?.clone();
+        let mut last_group = None;
+
+        let (lines, _) = native_scrollback_chronological_event_lines(
+            &app,
+            &state,
+            &parent.id,
+            0,
+            100,
+            &mut last_group,
+        );
+        let text = lines_plain_text(&lines);
+
+        assert!(text.contains("explain this repo"));
+        assert!(text.contains("repo-explorer started"));
+        assert!(text.contains("subagent finished"));
+        assert!(text.contains("Short helper summary"));
+        assert!(text.contains("README.md"));
+        assert!(!text.contains("read every repo file"));
+        assert!(!text.contains("CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"));
+        Ok(())
+    }
+
+    #[test]
     fn long_browser_urls_do_not_overrun_the_timeline_column() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -3022,7 +3074,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn native_scrollback_live_view_shows_tail_above_bottom_composer() -> Result<()> {
+    fn native_scrollback_live_view_does_not_replay_completed_transcript() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.args.height = 44;
@@ -3053,10 +3105,12 @@ mod redesign_tests {
         app.native_history.reset_for_session(session.id, last_seq);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("go say hi to aitor"));
-        assert!(screen.contains("Hi Aitor"));
         assert!(screen.contains("Ask a follow-up"));
-        assert!(row_containing(&screen, "Ask a follow-up") > row_containing(&screen, "Hi Aitor"));
+        assert!(screen.contains("Enter:reply"));
+        assert!(!screen.contains("describe this repo"));
+        assert!(!screen.contains("go say hi to aitor"));
+        assert!(!screen.contains("It is a Rust browser-agent workbench."));
+        assert!(!screen.contains("Hi Aitor"));
         Ok(())
     }
 
