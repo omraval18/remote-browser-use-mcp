@@ -129,7 +129,7 @@ fn render_main(
         .height
         .saturating_sub(bottom_h)
         .saturating_sub(footer_h);
-    let v2_model = if native_scrollback_active {
+    let transcript_model = if native_scrollback_active {
         transcript::transcript_model(app, state)
     } else {
         None
@@ -138,7 +138,7 @@ fn render_main(
         Vec::new()
     } else if native_scrollback_active {
         let mut lines =
-            transcript::active_viewport_lines(v2_model.as_ref(), body_width, max_body_h);
+            transcript::active_viewport_lines(transcript_model.as_ref(), body_width, max_body_h);
         if lines.is_empty() {
             if let Some(next) = next_action_lines(state, app, product_state) {
                 lines = next;

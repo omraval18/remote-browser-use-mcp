@@ -171,6 +171,6 @@ That smoke covers browser download artifact indexing and stale-session recovery 
 - `docs/terminal-ui-product-ux.md`
 - `docs/terminal-ui-testing.md`
 - `docs/rewrite-verification.md`
-- `docs/renderer-v2-complete-build-plan.md`
+- `docs/terminal-renderer-architecture.md`
 - `docs/tui-live-state-cache-plan.md`
 - `docs/plan-pure-rust-browser-harness.md`

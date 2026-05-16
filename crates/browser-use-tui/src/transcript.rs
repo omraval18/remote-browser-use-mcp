@@ -8,8 +8,6 @@ use crate::theme::{accent, dim, failed, link, muted, text_style, thought};
 
 use super::App;
 
-pub(crate) type RenderCellId = String;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
     Scrollback,
@@ -27,7 +25,7 @@ pub(crate) struct TranscriptModel {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TranscriptNode {
-    id: RenderCellId,
+    id: String,
     seq: i64,
     revision: u64,
     kind: TranscriptKind,
@@ -75,24 +73,8 @@ enum NodeStyle {
     Thought,
 }
 
-#[allow(dead_code)]
-pub(crate) trait RenderCell {
-    fn id(&self) -> &RenderCellId;
-    fn seq(&self) -> i64;
-    fn revision(&self) -> u64;
-    fn display_lines(&self, width: u16, mode: DisplayMode) -> Vec<Line<'static>>;
-    fn plain_lines(&self) -> Vec<String>;
-
-    fn desired_height(&self, width: u16, mode: DisplayMode) -> u16 {
-        self.display_lines(width, mode)
-            .len()
-            .try_into()
-            .unwrap_or(u16::MAX)
-    }
-}
-
-impl RenderCell for TranscriptNode {
-    fn id(&self) -> &RenderCellId {
+impl TranscriptNode {
+    fn id(&self) -> &str {
         &self.id
     }
 
@@ -172,6 +154,15 @@ impl RenderCell for TranscriptNode {
             TranscriptKind::Cancelled { text } => vec![format!(": stopped"), text.clone()],
         }
     }
+
+    fn is_terminal_scrollback_transient(&self) -> bool {
+        matches!(
+            &self.kind,
+            TranscriptKind::Timeline { group, style, .. }
+                if group == "thinking"
+                    || (*style == NodeStyle::Thought && group.starts_with("thought"))
+        )
+    }
 }
 
 pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<TranscriptModel> {
@@ -250,17 +241,6 @@ pub(crate) fn active_viewport_lines(
         lines = lines.into_iter().skip(start).collect();
     }
     lines
-}
-
-impl TranscriptNode {
-    fn is_terminal_scrollback_transient(&self) -> bool {
-        matches!(
-            &self.kind,
-            TranscriptKind::Timeline { group, style, .. }
-                if group == "thinking"
-                    || (*style == NodeStyle::Thought && group.starts_with("thought"))
-        )
-    }
 }
 
 pub(crate) fn model_plain_text(model: &TranscriptModel) -> String {

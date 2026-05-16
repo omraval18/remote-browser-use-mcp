@@ -1815,7 +1815,7 @@ impl TerminalDriver {
     }
 
     fn draw(&mut self, app: &mut App) -> Result<()> {
-        maybe_emit_v2_transcript(&mut self.terminal, app)?;
+        maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
         Ok(())
     }
@@ -1942,7 +1942,7 @@ fn is_unmodified_enter_event(event: &TermEvent) -> bool {
     )
 }
 
-fn maybe_emit_v2_transcript(
+fn maybe_emit_native_transcript(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
