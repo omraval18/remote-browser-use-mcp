@@ -3023,6 +3023,28 @@ mod redesign_tests {
     }
 
     #[test]
+    fn wrapped_composer_keeps_first_visual_line_visible_at_wrap_boundary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.width = 40;
+        let app_width = app
+            .args
+            .width
+            .saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2))
+            .max(1);
+        let input_area_width = app_width.saturating_sub(4).max(1);
+        let content_width = input_area_width.saturating_sub(2).max(1);
+        let first_visual_line = "x".repeat(content_width as usize);
+        app.set_input(format!("{first_visual_line}y"));
+
+        let screen = render_dump(&mut app)?;
+        let first_row = row_containing(&screen, &format!("> {first_visual_line}"));
+        let second_row = row_containing(&screen, "  y");
+        assert_eq!(second_row, first_row + 1, "{screen}");
+        Ok(())
+    }
+
+    #[test]
     fn long_results_use_terminal_scrollback_not_internal_scroll() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_args = Args {

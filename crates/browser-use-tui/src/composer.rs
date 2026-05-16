@@ -102,6 +102,11 @@ impl Composer {
         )
     }
 
+    pub(crate) fn visual_line_count_wrapped(&self, width: usize) -> usize {
+        let content_width = width.saturating_sub(2).max(1);
+        self.wrapped_line_count(content_width)
+    }
+
     pub(crate) fn cursor_position_wrapped(&self, max_lines: usize, width: usize) -> (u16, u16) {
         if self.is_empty() {
             return (2, 0);
@@ -112,10 +117,11 @@ impl Composer {
         for line in self.text.split('\n').take(cursor_row) {
             visual_row += wrapped_line_count(line, content_width);
         }
-        visual_row += cursor_col / content_width;
+        let (cursor_line_row, cursor_line_col) = wrapped_cursor_row_col(cursor_col, content_width);
+        visual_row += cursor_line_row;
         let visible_start = self.visible_wrapped_line_start(max_lines, width);
         (
-            cursor_col.rem_euclid(content_width).saturating_add(2) as u16,
+            cursor_line_col.saturating_add(2) as u16,
             visual_row.saturating_sub(visible_start) as u16,
         )
     }
@@ -267,7 +273,8 @@ impl Composer {
         for line in self.text.split('\n').take(cursor_row) {
             cursor_visual_row += wrapped_line_count(line, content_width);
         }
-        cursor_visual_row += cursor_col / content_width;
+        let (cursor_line_row, _) = wrapped_cursor_row_col(cursor_col, content_width);
+        cursor_visual_row += cursor_line_row;
         let max_start = line_count.saturating_sub(max_lines);
         cursor_visual_row
             .saturating_sub(max_lines.saturating_sub(1))
@@ -523,6 +530,15 @@ fn wrapped_line_count(line: &str, width: usize) -> usize {
     line.chars().count().saturating_add(width.saturating_sub(1)) / width
 }
 
+fn wrapped_cursor_row_col(cursor_col: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    if cursor_col == 0 {
+        return (0, 0);
+    }
+    let previous_cell = cursor_col - 1;
+    (previous_cell / width, previous_cell % width + 1)
+}
+
 fn normalize_pasted_text(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -640,6 +656,17 @@ fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
 mod tests {
     use super::*;
 
+    fn plain(lines: Vec<Line<'static>>) -> String {
+        let mut out = String::new();
+        for line in lines {
+            for span in line.spans {
+                out.push_str(&span.content);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn shifted_letters_insert_as_uppercase() {
         let mut composer = Composer::default();
@@ -682,5 +709,34 @@ mod tests {
         composer.set_input("something-bla".to_string());
         assert!(composer.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL,)));
         assert_eq!(composer.input(), "");
+    }
+
+    #[test]
+    fn wrapped_visual_line_count_matches_rendered_prompt_width() {
+        let mut composer = Composer::default();
+        composer.set_input("abcdefg".to_string());
+
+        assert_eq!(composer.visual_line_count_wrapped(8), 2);
+        assert_eq!(
+            plain(composer.render_lines_wrapped(
+                composer.visual_line_count_wrapped(8),
+                8,
+                "placeholder",
+            )),
+            "> abcdef\n  g\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_cursor_stays_at_end_of_exactly_full_visual_line() {
+        let mut composer = Composer::default();
+        composer.set_input("abcdef".to_string());
+
+        assert_eq!(composer.render_lines_wrapped(1, 8, "placeholder").len(), 1);
+        assert_eq!(composer.cursor_position_wrapped(1, 8), (8, 0));
+
+        composer.set_input("abcdefghijkl".to_string());
+        assert_eq!(composer.render_lines_wrapped(2, 8, "placeholder").len(), 2);
+        assert_eq!(composer.cursor_position_wrapped(2, 8), (8, 1));
     }
 }

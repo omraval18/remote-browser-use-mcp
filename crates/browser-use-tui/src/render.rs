@@ -329,7 +329,7 @@ fn main_bottom_height_for(
 }
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
-    let visual_input_lines = composer_visual_input_lines(app, width);
+    let visual_input_lines = composer_visual_input_lines(app, composer_input_area_width(width));
     let palette_h = slash_palette_pane_height(app);
     if palette_h > 0 {
         visual_input_lines + palette_h + 1
@@ -338,21 +338,14 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     }
 }
 
-fn composer_visual_input_lines(app: &App, width: u16) -> u16 {
-    let input_width = width.saturating_sub(4).max(1) as usize;
-    let visual_input_lines = if app.composer.input().is_empty() {
-        1
-    } else {
-        app.composer
-            .input()
-            .split('\n')
-            .map(|line| {
-                let len = line.chars().count();
-                len.saturating_add(input_width.saturating_sub(1)) / input_width
-            })
-            .map(|lines| lines.max(1))
-            .sum::<usize>()
-    };
+fn composer_input_area_width(width: u16) -> u16 {
+    width.saturating_sub(4).max(1)
+}
+
+fn composer_visual_input_lines(app: &App, input_area_width: u16) -> u16 {
+    let visual_input_lines = app
+        .composer
+        .visual_line_count_wrapped(input_area_width as usize);
     visual_input_lines.clamp(1, 10) as u16
 }
 
@@ -578,7 +571,7 @@ fn render_composer(
         return;
     }
     let palette_h = slash_palette_pane_height(app);
-    let input_h = composer_visual_input_lines(app, area.width.saturating_sub(4));
+    let input_h = composer_visual_input_lines(app, composer_input_area_width(area.width));
     let action_h = if palette_h > 0 { palette_h } else { 1 };
     let constraints = if palette_h > 0 {
         vec![
@@ -753,9 +746,7 @@ fn render_composer_input(
             .composer
             .cursor_position_wrapped(max_lines, area.width as usize);
         frame.set_cursor_position(Position {
-            x: area
-                .x
-                .saturating_add(cursor_x.min(area.width.saturating_sub(1))),
+            x: area.x.saturating_add(cursor_x.min(area.width)),
             y: area
                 .y
                 .saturating_add(cursor_y.min(area.height.saturating_sub(1))),
