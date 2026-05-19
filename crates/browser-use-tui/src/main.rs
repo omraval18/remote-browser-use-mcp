@@ -113,6 +113,19 @@ impl Surface {
         )
     }
 
+    /// Surfaces that render as a centered floating popup overlay on top of the
+    /// main view, rather than as a fullscreen surface or an inline bottom pane.
+    fn is_popup(self) -> bool {
+        self.is_bottom_pane()
+    }
+
+    /// Popups that read text input from the shared composer buffer. While one
+    /// of these is active the composer must not also be rendered underneath —
+    /// the popup itself is the input field, with its own cursor.
+    fn is_text_input_popup(self) -> bool {
+        matches!(self, Self::ApiKey | Self::Telemetry)
+    }
+
     fn uses_main_view(self) -> bool {
         self == Self::Main || self.is_bottom_pane()
     }

@@ -4,7 +4,7 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,6 +58,28 @@ pub(crate) fn native_scrollback_lines(app: &mut App, width: u16) -> Result<Vec<L
     Ok(lines)
 }
 
+/// Strip trailing spaces from each line in place, so right-side column padding
+/// stops counting toward the wrap budget. With this applied before a `Paragraph`
+/// that has `Wrap` enabled, narrowing the terminal clips the empty tail off the
+/// line rather than wrapping the padding to a new visual row.
+fn trim_trailing_whitespace(lines: &mut Vec<Line<'static>>) {
+    for line in lines.iter_mut() {
+        while let Some(last) = line.spans.last_mut() {
+            let trimmed_len = last.content.trim_end_matches(' ').len();
+            if trimmed_len == 0 {
+                line.spans.pop();
+            } else {
+                if trimmed_len != last.content.len() {
+                    let style = last.style;
+                    let trimmed = last.content[..trimmed_len].to_string();
+                    *last = Span::styled(trimmed, style);
+                }
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) fn lines_plain_text(lines: &[Line<'static>]) -> String {
     let mut out = String::new();
     for line in lines {
@@ -88,6 +110,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     match app.surface {
+        surface if surface.is_popup() => {
+            render_main(frame, area, app, &state, product_state);
+            render_popup_overlay(frame, area, app, &state, surface);
+        }
         surface if surface.uses_main_view() => render_main(frame, area, app, &state, product_state),
         surface => render_surface(frame, area, app, &state, surface),
     }
@@ -120,10 +146,17 @@ fn render_main(
     state: &WorkbenchState,
     product_state: ProductState,
 ) {
-    let bottom_h = main_bottom_height_for(app, state, app.surface, area, product_state);
+    // Popup surfaces float over the main view; the underlying main layout
+    // should ignore them and render as if no surface were open.
+    let layout_surface = if app.surface.is_popup() {
+        Surface::Main
+    } else {
+        app.surface
+    };
+    let bottom_h = main_bottom_height_for(app, state, layout_surface, area, product_state);
     let body_width = content_width(area.width);
     let native_scrollback_active = app.native_scrollback_is_active();
-    let show_footer = app.surface.is_bottom_pane()
+    let show_footer = layout_surface.is_bottom_pane()
         || app
             .quit_hint_until
             .is_some_and(|until| std::time::Instant::now() <= until)
@@ -158,7 +191,7 @@ fn render_main(
         }
     };
     let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active)
-        && !app.surface.is_bottom_pane();
+        && !layout_surface.is_bottom_pane();
     let (body_area, bottom_area, footer_area) =
         main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
     let mut body = body;
@@ -192,14 +225,20 @@ fn render_main(
     } else {
         body_area
     };
+    trim_trailing_whitespace(&mut body);
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
         content_area(body_render_area),
     );
-    if app.surface.is_bottom_pane() {
-        render_bottom_pane(frame, bottom_area, app, state, app.surface);
+    if layout_surface.is_bottom_pane() {
+        render_bottom_pane(frame, bottom_area, app, state, layout_surface);
+    } else if app.surface.is_text_input_popup() {
+        // The popup itself is the input — don't render the composer under it,
+        // or the user sees their typing duplicated. Clear the area so nothing
+        // bleeds through behind the floating popup.
+        frame.render_widget(Clear, bottom_area);
     } else {
         render_composer(frame, bottom_area, app, state, product_state);
     }
@@ -265,7 +304,8 @@ fn main_bottom_height_for(
     if !surface.is_bottom_pane() {
         return composer_pane_height(app, product_state, area.width);
     }
-    let line_count = surface_lines(surface, app, state).len() as u16;
+    let line_count = surface_lines(surface, app, state, content_width(area.width) as usize)
+        .len() as u16;
     let max_height = match surface {
         Surface::Model | Surface::History => area.height.saturating_sub(2).max(6),
         Surface::BrowserSelect => 22,
@@ -326,12 +366,169 @@ fn render_bottom_pane(
         .constraints([Constraint::Length(header_h), Constraint::Min(1)])
         .split(area);
     frame.render_widget(Paragraph::new(header), content_area(chunks[0]));
+    let body_area = content_area(chunks[1]);
+    let body_width = body_area.width as usize;
+    let mut lines = surface_lines(surface, app, state, body_width);
+    // For surfaces whose body is a straight list of selectable rows indexed by
+    // `selected_row` (currently just History), keep the selection in view by
+    // dropping rows from the top once it would otherwise scroll off the bottom.
+    if matches!(surface, Surface::History) {
+        let body_h = body_area.height as usize;
+        if body_h > 0 && app.selected_row >= body_h {
+            let skip = app.selected_row + 1 - body_h;
+            lines = lines.into_iter().skip(skip).collect();
+        }
+    }
+    trim_trailing_whitespace(&mut lines);
     frame.render_widget(
-        Paragraph::new(surface_lines(surface, app, state))
+        Paragraph::new(lines)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        content_area(chunks[1]),
+        body_area,
     );
+}
+
+/// Centered floating popup overlay for slash-command-launched surfaces
+/// (history, browser, model, auth, telemetry, developer). Responsive: shrinks
+/// to fit small terminals and caps to a comfortable max on large ones.
+fn render_popup_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    state: &WorkbenchState,
+    surface: Surface,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    const MIN_W: u16 = 40;
+    const MIN_H: u16 = 10;
+    const MAX_W: u16 = 84;
+    const MAX_H: u16 = 26;
+    const H_MARGIN: u16 = 4;
+    const V_MARGIN: u16 = 2;
+
+    let popup_w = if area.width <= MIN_W {
+        area.width
+    } else {
+        area.width
+            .saturating_sub(H_MARGIN.saturating_mul(2))
+            .min(MAX_W)
+            .max(MIN_W)
+    };
+
+    // Estimate desired height from body content length + chrome
+    // (border 2 + header 4 + footer 2 = 8 lines).
+    let body_inner_width = popup_w.saturating_sub(2 + CONTENT_HORIZONTAL_MARGIN * 2).max(1) as usize;
+    let body_line_count = surface_lines(surface, app, state, body_inner_width).len() as u16;
+    let desired_h = body_line_count.saturating_add(8);
+
+    let popup_h = if area.height <= MIN_H {
+        area.height
+    } else {
+        desired_h
+            .clamp(MIN_H, MAX_H)
+            .min(area.height.saturating_sub(V_MARGIN.saturating_mul(2)))
+            .max(MIN_H.min(area.height))
+    };
+
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_rect = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    frame.render_widget(Clear, popup_rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border());
+    let inner = block.inner(popup_rect);
+    frame.render_widget(block, popup_rect);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Layout inside the popup: header lines, body, footer line.
+    let header = surface_header_lines(surface, inner.width);
+    let header_h = (header.len() as u16).min(inner.height);
+    let footer_text = surface_footer(surface);
+    let footer_h: u16 = if footer_text.is_empty() { 0 } else { 1 };
+    let body_h = inner.height.saturating_sub(header_h).saturating_sub(footer_h);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_h),
+            Constraint::Length(body_h),
+            Constraint::Length(footer_h),
+        ])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(header), content_area(chunks[0]));
+
+    let body_area = content_area(chunks[1]);
+    let mut lines = surface_lines(surface, app, state, body_area.width as usize);
+    if matches!(surface, Surface::History) {
+        let body_h = body_area.height as usize;
+        if body_h > 0 && app.selected_row >= body_h {
+            let skip = app.selected_row + 1 - body_h;
+            lines = lines.into_iter().skip(skip).collect();
+        }
+    }
+    // For text-input popups, position the terminal cursor at the end of the
+    // masked secret line so the user sees a blinking caret in the input field.
+    let cursor_pos: Option<(u16, u16)> = if surface.is_text_input_popup() {
+        let masked = match surface {
+            Surface::Telemetry => masked_secret(app.composer.input()),
+            Surface::ApiKey => {
+                let account = app.api_key_account.as_deref().unwrap_or("");
+                masked_secret_for_account(account, app.composer.input())
+            }
+            _ => String::new(),
+        };
+        let target = format!("  {masked}");
+        let cursor_col = target.chars().count() as u16;
+        let visible_h = body_area.height as usize;
+        lines.iter().take(visible_h).enumerate().find_map(|(row, line)| {
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if plain.starts_with(&target) {
+                Some((
+                    body_area.x.saturating_add(cursor_col.min(body_area.width)),
+                    body_area.y.saturating_add(row as u16),
+                ))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    trim_trailing_whitespace(&mut lines);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(text()))
+            .wrap(Wrap { trim: false }),
+        body_area,
+    );
+    if let Some((x, y)) = cursor_pos {
+        frame.set_cursor_position(Position { x, y });
+    }
+
+    if footer_h > 0 {
+        frame.render_widget(
+            Paragraph::new(footer_text)
+                .style(muted())
+                .alignment(Alignment::Right),
+            content_area(chunks[2]),
+        );
+    }
 }
 
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
@@ -389,7 +586,9 @@ fn render_surface(
         ])
         .split(area);
     frame.render_widget(Paragraph::new(header), chunks[0]);
-    let lines = surface_lines(surface, app, state);
+    let body_width = content_area(chunks[1]).width as usize;
+    let mut lines = surface_lines(surface, app, state, body_width);
+    trim_trailing_whitespace(&mut lines);
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().fg(text()))
@@ -451,7 +650,12 @@ fn surface_footer(surface: Surface) -> &'static str {
     }
 }
 
-fn surface_lines(surface: Surface, app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
+fn surface_lines(
+    surface: Surface,
+    app: &App,
+    state: &WorkbenchState,
+    width: usize,
+) -> Vec<Line<'static>> {
     match surface {
         Surface::Setup => setup_lines(app),
         Surface::Account => account_lines(app),
@@ -460,7 +664,7 @@ fn surface_lines(surface: Surface, app: &App, state: &WorkbenchState) -> Vec<Lin
         Surface::Model => model_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
-        Surface::History => history_lines(app, state),
+        Surface::History => history_lines(app, state, width),
         Surface::Developer => developer_lines(app, state),
         Surface::Main => Vec::new(),
     }
@@ -1142,11 +1346,14 @@ pub(crate) fn session_header_lines(
 }
 
 fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
-    let card_w = width.clamp(32, 94);
+    // Cap at 94 cols so the card has a comfortable max on wide terminals, but
+    // never enforce a min — when the terminal narrows below that cap the card
+    // shrinks with it instead of overflowing and forcing a wrap.
+    let card_w = width.min(94);
     let inner_w = card_w.saturating_sub(2);
     let rule = || Line::from(Span::styled(format!("+{}+", "-".repeat(inner_w)), border()));
     let mut lines = vec![rule()];
-    lines.extend(card_logo_lines(inner_w));
+    lines.push(card_header_line("Browser Use Terminal", inner_w));
     lines.push(card_blank_line(inner_w));
     lines.push(card_kv_line("model", &app.model, "/model", inner_w));
     lines.push(card_kv_line(
@@ -1173,44 +1380,6 @@ fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Lin
     lines
 }
 
-/// The Browser Use orbit mark — two crossed elliptical rings downsampled from
-/// the brand SVG into a symmetric 4-row block-character sprite — paired with
-/// the product name as the visual anchor of the session config card.
-fn card_logo_lines(inner_w: usize) -> Vec<Line<'static>> {
-    const SPRITE: [&str; 4] = [
-        "▟▀▜██▛▀▙",
-        "▜▟▀  ▀▙▛",
-        "▟▜▄  ▄▛▙",
-        "▜▄▟██▙▄▛",
-    ];
-    /// Sprite row the product name sits beside (vertically centered).
-    const TITLE_ROW: usize = 1;
-    /// Blank columns between the sprite and the product name.
-    const GAP: usize = 3;
-
-    SPRITE
-        .iter()
-        .enumerate()
-        .map(|(row, art)| {
-            let title = if row == TITLE_ROW { "Browser Use" } else { "" };
-            let used = 1 + art.chars().count() + GAP + title.chars().count();
-            let pad = inner_w.saturating_sub(used);
-            let mut spans = vec![
-                Span::styled("|", border()),
-                Span::raw(" "),
-                Span::styled((*art).to_string(), text_style()),
-                Span::raw(" ".repeat(GAP)),
-            ];
-            if !title.is_empty() {
-                spans.push(Span::styled(title.to_string(), bold()));
-            }
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled("|", border()));
-            Line::from(spans)
-        })
-        .collect()
-}
-
 fn card_blank_line(inner_w: usize) -> Line<'static> {
     card_text_line("", "", "", inner_w)
 }
@@ -1229,6 +1398,20 @@ fn card_kv_line(label: &str, value: &str, action: &str, inner_w: usize) -> Line<
         .max(4);
     let left = format!("{label:<label_w$}{}", truncate(value, value_w));
     card_text_line(&left, action, "", inner_w)
+}
+
+/// The bolded title row at the top of the config card.
+fn card_header_line(title: &str, inner_w: usize) -> Line<'static> {
+    let title = truncate(title, inner_w.saturating_sub(1));
+    let title_len = title.chars().count();
+    let trailing = inner_w.saturating_sub(title_len + 1);
+    Line::from(vec![
+        Span::styled("|", border()),
+        Span::raw(" "),
+        Span::styled(title, bold()),
+        Span::raw(" ".repeat(trailing)),
+        Span::styled("|", border()),
+    ])
 }
 
 fn card_text_line(left: &str, right: &str, _extra: &str, inner_w: usize) -> Line<'static> {
@@ -1402,7 +1585,7 @@ fn browser_panel_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> 
     lines
 }
 
-fn history_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
+fn history_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
     if state.history.is_empty() {
         return vec![Line::from(Span::styled("No previous work yet.", dim()))];
     }
@@ -1410,7 +1593,7 @@ fn history_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
         .history
         .iter()
         .enumerate()
-        .map(|(idx, row)| history_overlay_line(row, idx, app.selected_row, 88))
+        .map(|(idx, row)| history_overlay_line(row, idx, app.selected_row, width))
         .collect()
 }
 
@@ -1532,22 +1715,41 @@ fn history_overlay_line(
     selected_row: usize,
     width: usize,
 ) -> Line<'static> {
-    let task_width = width.saturating_sub(22).max(12);
-    highlight_selectable_row(
-        vec![
-            Span::styled(
-                format!("{:<task_width$}", truncate(&row.task, task_width)),
-                text_style(),
-            ),
-            Span::styled(
-                format!("{:<10}", row.status.as_str()),
-                status_style(row.status.as_str()),
-            ),
-            Span::styled(relative_time(row.updated_ms), muted()),
-        ],
-        idx == selected_row,
-        width,
-    )
+    // Layout priority is left-to-right: the task is the leftmost and most
+    // important column, then status, then the relative timestamp. When the
+    // terminal gets squished we drop time first, then status, so the task
+    // stays visible instead of being squeezed to zero. Each row must render
+    // as exactly one visual line — wrapping would throw off the History pane's
+    // scroll math, which counts data rows.
+    const INDENT: usize = 2;
+    const STATUS_COL_W: usize = 10;
+    const TASK_FLOOR: usize = 6;
+    let time_str = relative_time(row.updated_ms);
+    let time_w = time_str.chars().count();
+    let full_task_w = width.saturating_sub(INDENT + STATUS_COL_W + time_w);
+    let no_time_task_w = width.saturating_sub(INDENT + STATUS_COL_W);
+    let task_only_w = width.saturating_sub(INDENT);
+    let (task_w, show_status, show_time) = if full_task_w >= TASK_FLOOR {
+        (full_task_w, true, true)
+    } else if no_time_task_w >= TASK_FLOOR {
+        (no_time_task_w, true, false)
+    } else {
+        (task_only_w, false, false)
+    };
+    let mut content = vec![Span::styled(
+        format!("{:<task_w$}", truncate(&row.task, task_w)),
+        text_style(),
+    )];
+    if show_status {
+        content.push(Span::styled(
+            format!("{:<STATUS_COL_W$}", row.status.as_str()),
+            status_style(row.status.as_str()),
+        ));
+    }
+    if show_time {
+        content.push(Span::styled(time_str, muted()));
+    }
+    highlight_selectable_row(content, idx == selected_row, width)
 }
 
 /// The single source of truth for selectable-row styling: a 2-space indent and,
@@ -1652,11 +1854,11 @@ fn masked_secret(value: &str) -> String {
     if value.is_empty() {
         "paste key here".to_string()
     } else {
-        let prefix = value.chars().take(8).collect::<String>();
-        format!(
-            "{prefix}{}",
-            "*".repeat(value.chars().count().saturating_sub(8).max(8))
-        )
+        let count = value.chars().count();
+        let visible = count.min(8);
+        let hidden = count.saturating_sub(8);
+        let prefix: String = value.chars().take(visible).collect();
+        format!("{prefix}{}", "*".repeat(hidden))
     }
 }
 
