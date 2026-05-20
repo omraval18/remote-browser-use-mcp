@@ -156,6 +156,9 @@ struct BrowserSession {
     browser_name: Option<String>,
     profile: Option<String>,
     last_error: Option<String>,
+    last_error_kind: Option<String>,
+    last_target_id: Option<String>,
+    last_session_id: Option<String>,
     logs: VecDeque<String>,
 }
 
@@ -175,6 +178,9 @@ impl Default for BrowserSession {
             browser_name: None,
             profile: None,
             last_error: None,
+            last_error_kind: None,
+            last_target_id: None,
+            last_session_id: None,
             logs: VecDeque::new(),
         }
     }
@@ -388,13 +394,25 @@ fn dispatch_local(
         Some("list") => Ok(json!({ "candidates": local_candidates() })),
         Some("setup") => {
             let url = "chrome://inspect/#remote-debugging";
-            let opened = open::that(url).is_ok();
+            let profile_ref = option_value(argv, "--profile");
+            let (opened, profile, open_error) = if let Some(profile_ref) = profile_ref {
+                let profiles = detect_local_profiles();
+                let selected = resolve_local_profile(&profiles, &profile_ref)?;
+                match open_local_profile_url(&selected, url) {
+                    Ok(()) => (true, Some(selected), None),
+                    Err(error) => (false, Some(selected), Some(format!("{error:#}"))),
+                }
+            } else {
+                (open::that(url).is_ok(), None, None)
+            };
             Ok(json!({
                 "status": "needs-user-action",
                 "opened": opened,
                 "url": url,
+                "profile": profile,
+                "open_error": open_error,
                 "instructions": [
-                    "In the browser that opens, enable 'Allow remote debugging for this browser instance'.",
+                    "In the browser/profile that opens, enable 'Allow remote debugging for this browser instance' if Chrome reports it is blocked.",
                     "If Chrome shows an additional permission prompt, click Allow.",
                     "Then run `browser connect local` again."
                 ],
@@ -504,11 +522,14 @@ impl BrowserSession {
         let page = json!({
             "target_id": self.current_target_id,
             "session_id": self.current_session_id,
+            "last_target_id": self.last_target_id,
+            "last_session_id": self.last_session_id,
         });
         json!({
             "mode": self.mode.as_str(),
             "connection": if connected { "connected" } else if self.endpoint.is_some() { "disconnected" } else { "not-configured" },
             "reason": self.last_error,
+            "loss_reason": self.last_error_kind,
             "next_step": self.next_step(),
             "owner": self.owner.as_str(),
             "browser": self.browser_name,
@@ -557,6 +578,16 @@ impl BrowserSession {
     fn next_step(&self) -> Option<&'static str> {
         if self.endpoint.is_none() {
             Some("browser connect local")
+        } else if matches!(
+            self.last_error_kind.as_deref(),
+            Some("browser-closed" | "stale-port")
+        ) && self.mode == BrowserMode::Local
+        {
+            Some("Open Chrome with the selected profile, then run browser connect local")
+        } else if self.last_error_kind.as_deref() == Some("permission-blocked")
+            && self.mode == BrowserMode::Local
+        {
+            Some("browser local setup")
         } else if self.connection.is_none() {
             Some("browser recover reconnect-websocket")
         } else if self.current_target_id.is_some() && self.current_session_id.is_none() {
@@ -571,24 +602,61 @@ impl BrowserSession {
         if candidates.is_empty() {
             self.last_error =
                 Some("No local remote-debugging browser candidates found".to_string());
+            self.last_error_kind = Some("browser-not-running".to_string());
             return Ok(json!({
                 "status": "blocked",
-                "reason": "No running Chromium-family browser with DevToolsActivePort was found.",
+                "state": "browser-not-running",
+                "reason": "No running Chromium-family browser is exposing a reachable local CDP endpoint.",
                 "next_step": "browser local setup",
             }));
         }
+        let reachable = candidates
+            .iter()
+            .filter(|candidate| candidate.connectable)
+            .cloned()
+            .collect::<Vec<_>>();
+        if reachable.is_empty() {
+            self.last_error =
+                Some("Only stale local browser debug candidates were found".to_string());
+            self.last_error_kind = Some("stale-port".to_string());
+            return Ok(json!({
+                "status": "blocked",
+                "state": "stale-port",
+                "reason": "Found stale DevToolsActivePort files, but no local Chrome CDP port is reachable. Chrome was likely closed or the debug server stopped.",
+                "candidates": candidates,
+                "next_step": "Open Chrome with the selected profile, then run browser connect local",
+            }));
+        }
         let candidate = if let Some(candidate_id) = candidate_id {
-            candidates
+            let Some(candidate) = candidates
                 .into_iter()
                 .find(|candidate| candidate.id == candidate_id)
-                .ok_or_else(|| anyhow!("unknown local candidate id: {candidate_id}"))?
-        } else if candidates.len() == 1 {
-            candidates.into_iter().next().expect("one candidate")
+            else {
+                bail!("unknown local candidate id: {candidate_id}");
+            };
+            if !candidate.connectable {
+                self.last_error = candidate.reason.clone();
+                self.last_error_kind = Some(candidate.state.clone());
+                return Ok(json!({
+                    "status": "blocked",
+                    "state": candidate.state,
+                    "reason": candidate.reason,
+                    "candidate": candidate,
+                    "next_step": "Open Chrome with this profile, then run browser connect local",
+                }));
+            }
+            candidate
+        } else if reachable.len() == 1 {
+            reachable
+                .into_iter()
+                .next()
+                .expect("one reachable candidate")
         } else {
             return Ok(json!({
                 "status": "needs-user-action",
-                "reason": "Multiple local browser candidates are available. Ask the user which browser/profile to attach.",
-                "candidates": candidates,
+                "reason": "Multiple reachable local browser candidates are available. Ask the user which browser/profile to attach.",
+                "candidates": reachable,
+                "ignored_candidates": candidates.into_iter().filter(|candidate| !candidate.connectable).collect::<Vec<_>>(),
                 "next_step": "browser connect local --candidate <id>",
             }));
         };
@@ -599,7 +667,22 @@ impl BrowserSession {
             ws_url: candidate.ws_url.clone(),
             candidate_id: Some(candidate.id.clone()),
         };
-        self.connect_endpoint(endpoint, BrowserMode::Local, BrowserOwner::External)?;
+        if let Err(error) =
+            self.connect_endpoint(endpoint, BrowserMode::Local, BrowserOwner::External)
+        {
+            let message = format!("{error:#}");
+            let kind = classify_browser_error(&message);
+            self.last_error = Some(message.clone());
+            self.last_error_kind = Some(kind.to_string());
+            return Ok(json!({
+                "status": "blocked",
+                "state": kind,
+                "reason": local_connect_error_reason(kind, &message),
+                "candidate": candidate,
+                "raw_error": message,
+                "next_step": local_connect_next_step(kind),
+            }));
+        }
         self.browser_name = Some(candidate.browser_name.clone());
         self.profile = Some(candidate.profile_path.display().to_string());
         Ok(json!({
@@ -784,6 +867,10 @@ impl BrowserSession {
         self.live_url = None;
         self.mode = BrowserMode::None;
         self.owner = BrowserOwner::None;
+        self.last_error = None;
+        self.last_error_kind = None;
+        self.last_target_id = None;
+        self.last_session_id = None;
         self.connection_generation += 1;
         Ok(json!({ "stopped": true, "browser_id": id }))
     }
@@ -802,6 +889,9 @@ impl BrowserSession {
         self.owner = owner;
         self.connection_generation += 1;
         self.last_error = None;
+        self.last_error_kind = None;
+        self.last_target_id = None;
+        self.last_session_id = None;
         self.attach_first_page()?;
         Ok(())
     }
@@ -885,6 +975,10 @@ impl BrowserSession {
             self.current_session_id = None;
             self.mode = BrowserMode::None;
             self.owner = BrowserOwner::None;
+            self.last_error = None;
+            self.last_error_kind = None;
+            self.last_target_id = None;
+            self.last_session_id = None;
             self.connection_generation += 1;
         }
     }
@@ -899,9 +993,31 @@ impl BrowserSession {
         }));
         checks.push(json!({
             "name": "local browser candidates",
-            "ok": !candidates.is_empty(),
+            "ok": candidates.iter().any(|candidate| candidate.connectable),
             "count": candidates.len(),
-            "next_step": if candidates.is_empty() { "browser local setup" } else { "browser connect local" },
+            "connectable_count": candidates.iter().filter(|candidate| candidate.connectable).count(),
+            "stale_count": candidates.iter().filter(|candidate| candidate.stale).count(),
+            "state": if candidates.iter().any(|candidate| candidate.connectable) {
+                "reachable"
+            } else if candidates.iter().any(|candidate| candidate.stale) {
+                "stale-port"
+            } else {
+                "browser-not-running"
+            },
+            "detail": if candidates.iter().any(|candidate| candidate.connectable) {
+                "At least one local browser CDP endpoint is reachable."
+            } else if candidates.iter().any(|candidate| candidate.stale) {
+                "DevToolsActivePort files exist, but their ports are not reachable. Chrome was likely closed or restarted."
+            } else {
+                "No local browser CDP endpoint is reachable."
+            },
+            "next_step": if candidates.iter().any(|candidate| candidate.connectable) {
+                "browser connect local"
+            } else if candidates.iter().any(|candidate| candidate.stale) {
+                "Open Chrome with the selected profile, then run browser connect local"
+            } else {
+                "browser local setup"
+            },
         }));
         let profiles = detect_local_profiles();
         checks.push(json!({
@@ -916,23 +1032,30 @@ impl BrowserSession {
             "ok": std::env::var("BROWSER_USE_API_KEY").is_ok_and(|value| !value.trim().is_empty()),
             "detail": "Only required for Browser Use cloud browsers and cloud profiles",
         }));
-        if self.endpoint.is_some() {
-            let cdp_ok = self.cdp("Browser.getVersion", None, json!({})).is_ok();
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            let endpoint_probe = probe_endpoint(endpoint);
+            let cdp_ok = endpoint_probe.ok;
             checks.push(json!({
                 "name": "CDP websocket",
                 "ok": cdp_ok,
-                "next_step": if cdp_ok { "" } else { "browser recover reconnect-websocket" },
+                "state": endpoint_probe.state,
+                "detail": endpoint_probe.detail,
+                "next_step": if cdp_ok {
+                    ""
+                } else if self.mode == BrowserMode::Local {
+                    endpoint_probe.next_step
+                } else {
+                    "browser recover reconnect-websocket"
+                },
             }));
-            let target_id = self.current_target_id.clone();
-            let target_ok = match target_id.as_deref() {
-                Some(target_id) => self.target_exists(target_id).unwrap_or(false),
-                None => false,
-            };
+            let target_ok =
+                cdp_ok && self.current_target_id.is_some() && self.current_session_id.is_some();
             checks.push(json!({
                 "name": "current target",
                 "ok": target_ok,
                 "target_id": self.current_target_id,
-                "next_step": if target_ok { "" } else { "browser recover reattach-same-target" },
+                "last_target_id": self.last_target_id,
+                "next_step": if target_ok { "" } else if cdp_ok { "browser recover reattach-same-target" } else { "Recover the browser connection before reattaching a target." },
             }));
         }
         checks.push(json!({
@@ -958,7 +1081,10 @@ impl BrowserSession {
             Err(error) => {
                 let message = format!("{error:#}");
                 self.last_error = Some(message.clone());
+                self.last_error_kind = Some(classify_browser_error(&message).to_string());
                 self.connection = None;
+                self.last_target_id = self.current_target_id.take();
+                self.last_session_id = self.current_session_id.take();
                 bail!(message);
             }
         }
@@ -1018,13 +1144,6 @@ impl BrowserSession {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
-    }
-
-    fn target_exists(&mut self, target_id: &str) -> Result<bool> {
-        Ok(self
-            .targets()?
-            .iter()
-            .any(|target| target["targetId"] == target_id))
     }
 
     fn attach_target(&mut self, target_id: &str) -> Result<String> {
@@ -1127,6 +1246,113 @@ fn set_cdp_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
     }
 }
 
+fn classify_browser_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("403 forbidden") || lower.contains("http error: 403") {
+        "permission-blocked"
+    } else if lower.contains("target")
+        && (lower.contains("not found")
+            || lower.contains("target-gone")
+            || lower.contains("no target with given id"))
+    {
+        "target-gone"
+    } else if lower.contains("connection refused")
+        || lower.contains("couldn't connect to server")
+        || lower.contains("unable to connect")
+        || lower.contains("operation timed out")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("websocket closed")
+        || lower.contains("already closed")
+    {
+        "browser-closed"
+    } else {
+        "websocket-dropped"
+    }
+}
+
+fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
+    match kind {
+        "permission-blocked" => {
+            "Chrome is running, but it rejected CDP control. Remote debugging permission is likely blocked for this browser instance.".to_string()
+        }
+        "browser-closed" => {
+            "Chrome is not currently exposing the selected local CDP endpoint. It may have been closed, restarted, or stopped its debug server.".to_string()
+        }
+        "target-gone" => "The previous browser tab target is gone.".to_string(),
+        _ => format!("Local browser CDP connection failed: {raw_error}"),
+    }
+}
+
+fn local_connect_next_step(kind: &str) -> &'static str {
+    match kind {
+        "permission-blocked" => "browser local setup",
+        "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
+        "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
+        _ => "browser doctor --json",
+    }
+}
+
+struct EndpointProbe {
+    ok: bool,
+    state: &'static str,
+    detail: String,
+    next_step: &'static str,
+}
+
+fn probe_endpoint(endpoint: &Endpoint) -> EndpointProbe {
+    let Some(http_url) = endpoint.http_url.as_deref() else {
+        return EndpointProbe {
+            ok: true,
+            state: "unknown",
+            detail:
+                "No DevTools HTTP endpoint is available to probe without touching the websocket."
+                    .to_string(),
+            next_step: "browser recover reconnect-websocket",
+        };
+    };
+    let url = format!("{}/json/version", http_url.trim_end_matches('/'));
+    let response = Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .send();
+    match response {
+        Ok(response) if response.status().is_success() => EndpointProbe {
+            ok: true,
+            state: "reachable",
+            detail: format!("{url} is reachable."),
+            next_step: "",
+        },
+        Ok(response) if response.status().as_u16() == 403 => EndpointProbe {
+            ok: false,
+            state: "permission-blocked",
+            detail: "The browser is reachable, but Chrome rejected DevTools access with 403."
+                .to_string(),
+            next_step: "browser local setup",
+        },
+        Ok(response) => EndpointProbe {
+            ok: false,
+            state: "endpoint-error",
+            detail: format!("{url} returned HTTP {}.", response.status()),
+            next_step: "browser recover reconnect-websocket",
+        },
+        Err(error) => EndpointProbe {
+            ok: false,
+            state: if endpoint.kind == "devtools-active-port" {
+                "browser-closed"
+            } else {
+                "websocket-dropped"
+            },
+            detail: format!("{url} is not reachable: {error:#}"),
+            next_step: if endpoint.kind == "devtools-active-port" {
+                "Open Chrome with the selected profile, then run browser connect local"
+            } else {
+                "browser recover reconnect-websocket"
+            },
+        },
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct LocalCandidate {
     id: String,
@@ -1136,12 +1362,23 @@ struct LocalCandidate {
     ws_url: String,
     source: String,
     connectable: bool,
+    state: String,
+    stale: bool,
+    reason: Option<String>,
+    next_step: Option<String>,
 }
 
 fn local_candidates() -> Vec<LocalCandidate> {
+    local_candidates_from_roots(known_profile_roots(), &[9222_u16, 9223])
+}
+
+fn local_candidates_from_roots(
+    roots: Vec<(&'static str, PathBuf)>,
+    probe_ports: &[u16],
+) -> Vec<LocalCandidate> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
-    for (browser_name, root) in known_profile_roots() {
+    for (browser_name, root) in roots {
         let active = root.join("DevToolsActivePort");
         let Ok(raw) = fs::read_to_string(&active) else {
             continue;
@@ -1160,6 +1397,11 @@ fn local_candidates() -> Vec<LocalCandidate> {
         let id = format!("local-{}", candidates.len() + 1);
         let http_url = Some(format!("http://127.0.0.1:{port}"));
         let connectable = tcp_port_open("127.0.0.1", port.parse().unwrap_or(0));
+        let state = if connectable {
+            "reachable"
+        } else {
+            "stale-port"
+        };
         candidates.push(LocalCandidate {
             id,
             browser_name: browser_name.to_string(),
@@ -1168,9 +1410,19 @@ fn local_candidates() -> Vec<LocalCandidate> {
             ws_url,
             source: active.display().to_string(),
             connectable,
+            state: state.to_string(),
+            stale: !connectable,
+            reason: (!connectable).then(|| {
+                "DevToolsActivePort exists, but the recorded CDP port is not reachable. Chrome was likely closed or the debug server stopped.".to_string()
+            }),
+            next_step: Some(if connectable {
+                "browser connect local --candidate <id>".to_string()
+            } else {
+                "Open Chrome with this profile, then run browser connect local".to_string()
+            }),
         });
     }
-    for port in [9222_u16, 9223] {
+    for port in probe_ports {
         let http_url = format!("http://127.0.0.1:{port}");
         let Ok(ws_url) = resolve_ws_from_http(&http_url) else {
             continue;
@@ -1186,6 +1438,10 @@ fn local_candidates() -> Vec<LocalCandidate> {
             ws_url,
             source: "port-probe".to_string(),
             connectable: true,
+            state: "reachable".to_string(),
+            stale: false,
+            reason: None,
+            next_step: Some("browser connect local --candidate <id>".to_string()),
         });
     }
     candidates
@@ -2027,6 +2283,20 @@ fn resolve_local_profile(
     }
 }
 
+fn open_local_profile_url(profile: &LocalBrowserProfile, url: &str) -> Result<()> {
+    let mut command = Command::new(&profile.browser_path);
+    command
+        .arg(format!("--profile-directory={}", profile.profile_dir))
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+        .spawn()
+        .with_context(|| format!("open {} with {}", url, profile.display_name))?;
+    Ok(())
+}
+
 fn inspect_local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Value> {
     let temp = tempfile::Builder::new()
         .prefix("but-profile-inspect.")
@@ -2829,7 +3099,7 @@ mod tests {
                 .unwrap();
         let text = output.content.as_str().unwrap();
         assert!(text.contains("browser doctor"));
-        assert!(text.contains("next: browser connect local"));
+        assert!(text.contains("next:"));
     }
 
     #[test]
@@ -2878,6 +3148,27 @@ mod tests {
         assert_eq!(output.content["source"], "rust-local-filesystem");
         assert!(output.content["profiles"].is_array());
         assert!(!output.content.to_string().contains("profile-use"));
+    }
+
+    #[test]
+    fn stale_devtools_active_port_is_not_connectable() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("DevToolsActivePort"),
+            "9\n/devtools/browser/stale\n",
+        )
+        .unwrap();
+        let candidates =
+            local_candidates_from_roots(vec![("Test Chrome", temp.path().to_path_buf())], &[]);
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].connectable);
+        assert_eq!(candidates[0].state, "stale-port");
+        assert!(candidates[0].stale);
+        assert!(candidates[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("DevToolsActivePort"));
     }
 
     #[test]

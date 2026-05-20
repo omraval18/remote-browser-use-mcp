@@ -23,13 +23,16 @@ use browser_use_providers::{
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{now_ms, AgentSummary, Store};
 use opentelemetry::KeyValue;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use telemetry::{AgentTelemetry, ModelTurnSpanInput};
 use tools::{ToolHandlerKind, ToolRegistry};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MAX_TOOL_OUTPUT_TEXT_TOKENS: usize = 4_000;
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
+const BROWSER_PREF_MODE: &str = "browser.preference.mode";
+const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
+const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct FakeAgentOptions<'a> {
@@ -2892,12 +2895,20 @@ fn dispatch_browser_tool(
             "arguments": call.arguments,
         }),
     )?;
-    let output = browser_use_browser::run_browser_command(
-        &session.id,
-        &session.cwd,
-        &session.artifact_root,
-        cmd,
-    )?;
+    let output = if let Some(content) = dispatch_browser_preference_command(store, session, cmd)? {
+        browser_use_browser::BrowserCommandOutput {
+            content,
+            events: Vec::new(),
+        }
+    } else {
+        let resolved_cmd = resolve_browser_connect_command(store, cmd)?;
+        browser_use_browser::run_browser_command(
+            &session.id,
+            &session.cwd,
+            &session.artifact_root,
+            &resolved_cmd,
+        )?
+    };
     for event in &output.events {
         record_python_browser_event(store, &session.id, event)?;
     }
@@ -2920,6 +2931,280 @@ fn dispatch_browser_tool(
             output.content,
         )?],
     })
+}
+
+fn dispatch_browser_preference_command(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    cmd: &str,
+) -> Result<Option<Value>> {
+    let argv = browser_command_words(cmd);
+    let args = strip_browser_prefix(&argv);
+    let Some(first) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match first {
+        "preference" | "preferences" => Ok(Some(dispatch_browser_preference(store, &args)?)),
+        "profile" | "profiles"
+            if args.get(1).is_some_and(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "suggest" | "use" | "remember" | "forget" | "current"
+                )
+            }) =>
+        {
+            Ok(Some(dispatch_browser_profile_preference(
+                store, session, &args,
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn dispatch_browser_preference(store: &Store, args: &[String]) -> Result<Value> {
+    match args.get(1).map(String::as_str) {
+        None | Some("--json") | Some("show") => browser_preference_json(store),
+        Some("use") => {
+            let mode = args.get(2).map(String::as_str).ok_or_else(|| {
+                anyhow!("browser preference use requires <local|cloud|managed-headless>")
+            })?;
+            let normalized = normalize_browser_preference_mode(mode)?;
+            store.set_setting(BROWSER_PREF_MODE, normalized)?;
+            store.set_setting("browser", browser_display_name(normalized))?;
+            Ok(json!({
+                "status": "ok",
+                "preference": browser_preference_json(store)?,
+                "next_step": "browser connect",
+            }))
+        }
+        Some(other) => bail!("unknown browser preference command: {other}"),
+    }
+}
+
+fn dispatch_browser_profile_preference(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    args: &[String],
+) -> Result<Value> {
+    match args.get(1).map(String::as_str) {
+        Some("current") => browser_preference_json(store),
+        Some("use") => {
+            let profile_id = args
+                .get(2)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow!("browser profile use requires <profile-id>"))?;
+            store.set_setting(BROWSER_PREF_PROFILE, profile_id)?;
+            Ok(json!({
+                "status": "ok",
+                "profile_id": profile_id,
+                "next_step": "browser connect",
+            }))
+        }
+        Some("remember") => {
+            let domain = option_value_core(args, "--domain")
+                .ok_or_else(|| anyhow!("browser profile remember requires --domain <domain>"))?;
+            let profile_id = option_value_core(args, "--profile")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| {
+                    anyhow!("browser profile remember requires --profile <profile-id>")
+                })?;
+            let mode = option_value_core(args, "--mode")
+                .map(|mode| normalize_browser_preference_mode(&mode).map(ToOwned::to_owned))
+                .transpose()?
+                .or_else(|| store.get_setting(BROWSER_PREF_MODE).ok().flatten())
+                .unwrap_or_else(|| "local".to_string());
+            let value = json!({
+                "domain": normalize_domain(&domain),
+                "mode": mode,
+                "profile_id": profile_id,
+            });
+            store.set_setting(
+                &browser_domain_profile_key(&domain),
+                &serde_json::to_string(&value)?,
+            )?;
+            store.set_setting(BROWSER_PREF_MODE, value["mode"].as_str().unwrap_or("local"))?;
+            store.set_setting(
+                BROWSER_PREF_PROFILE,
+                value["profile_id"].as_str().unwrap_or(""),
+            )?;
+            store.set_setting(
+                "browser",
+                browser_display_name(value["mode"].as_str().unwrap_or("local")),
+            )?;
+            Ok(json!({
+                "status": "ok",
+                "remembered": value,
+                "next_step": "browser connect",
+            }))
+        }
+        Some("forget") => {
+            let domain = option_value_core(args, "--domain")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser profile forget requires --domain <domain>"))?;
+            store.delete_setting(&browser_domain_profile_key(&domain))?;
+            Ok(json!({ "status": "ok", "forgot_domain": normalize_domain(&domain) }))
+        }
+        Some("suggest") => {
+            let domain = option_value_core(args, "--domain")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser profile suggest requires --domain <domain>"))?;
+            let remembered = remembered_domain_profile(store, &domain)?;
+            let profiles = browser_use_browser::run_browser_command(
+                &session.id,
+                &session.cwd,
+                &session.artifact_root,
+                "browser local profiles --json",
+            )
+            .map(|output| output.content)
+            .unwrap_or_else(|error| {
+                json!({
+                    "status": "failed",
+                    "error": format!("{error:#}"),
+                    "profiles": [],
+                })
+            });
+            Ok(json!({
+                "status": "ok",
+                "domain": normalize_domain(&domain),
+                "remembered": remembered,
+                "local_profiles": profiles.get("profiles").cloned().unwrap_or_else(|| json!([])),
+                "next_step": if remembered.is_some() { "browser connect" } else { "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>" },
+            }))
+        }
+        Some(other) => bail!("unknown browser profile command: {other}"),
+        None => browser_preference_json(store),
+    }
+}
+
+fn resolve_browser_connect_command(store: &Store, cmd: &str) -> Result<String> {
+    let argv = browser_command_words(cmd);
+    let args = strip_browser_prefix(&argv);
+    if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
+        let mode = store
+            .get_setting(BROWSER_PREF_MODE)?
+            .unwrap_or_else(|| "local".to_string());
+        let command = match normalize_browser_preference_mode(&mode)? {
+            "cloud" => "browser remote start",
+            "managed-headless" => "browser connect managed --headless",
+            "managed-headed" => "browser connect managed --headed",
+            "local" => "browser connect local",
+            _ => "browser connect local",
+        };
+        Ok(command.to_string())
+    } else {
+        Ok(cmd.to_string())
+    }
+}
+
+fn browser_preference_json(store: &Store) -> Result<Value> {
+    let mode = store
+        .get_setting(BROWSER_PREF_MODE)?
+        .or_else(|| {
+            store
+                .get_setting("browser")
+                .ok()
+                .flatten()
+                .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+        })
+        .unwrap_or_else(|| "local".to_string());
+    let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+    let domain_profiles = store
+        .list_settings()?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix(BROWSER_DOMAIN_PROFILE_PREFIX)
+                .and_then(|domain| {
+                    serde_json::from_str::<Value>(&value)
+                        .ok()
+                        .map(|value| (domain.to_string(), value))
+                })
+        })
+        .map(|(domain, value)| json!({ "domain": domain, "preference": value }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "mode": normalize_browser_preference_mode(&mode)?,
+        "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
+        "profile_id": profile_id,
+        "domain_profiles": domain_profiles,
+        "connect_command": match normalize_browser_preference_mode(&mode)? {
+            "cloud" => "browser remote start",
+            "managed-headless" => "browser connect managed --headless",
+            "managed-headed" => "browser connect managed --headed",
+            _ => "browser connect local",
+        },
+    }))
+}
+
+fn remembered_domain_profile(store: &Store, domain: &str) -> Result<Option<Value>> {
+    store
+        .get_setting(&browser_domain_profile_key(domain))?
+        .map(|raw| serde_json::from_str::<Value>(&raw).map_err(Into::into))
+        .transpose()
+}
+
+fn browser_command_words(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace().map(ToOwned::to_owned).collect()
+}
+
+fn strip_browser_prefix(argv: &[String]) -> Vec<String> {
+    if argv.first().is_some_and(|arg| arg == "browser") {
+        argv[1..].to_vec()
+    } else {
+        argv.to_vec()
+    }
+}
+
+fn option_value_core(argv: &[String], flag: &str) -> Option<String> {
+    argv.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn browser_domain_profile_key(domain: &str) -> String {
+    format!(
+        "{BROWSER_DOMAIN_PROFILE_PREFIX}{}",
+        normalize_domain(domain)
+    )
+}
+
+fn normalize_browser_preference_mode(mode: &str) -> Result<&'static str> {
+    let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "local-chrome" => Ok("local"),
+        "cloud" | "browser-use-cloud" => Ok("cloud"),
+        "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
+        "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
+        other => bail!("unknown browser preference mode: {other}"),
+    }
+}
+
+fn browser_display_name(mode: &str) -> &'static str {
+    match mode {
+        "cloud" => "Browser Use cloud",
+        "managed-headless" => "Headless Chromium",
+        "managed-headed" => "Managed Chromium",
+        _ => "Local Chrome",
+    }
+}
+
+fn display_browser_to_mode(display: &str) -> Option<&'static str> {
+    match display {
+        "Browser Use cloud" => Some("cloud"),
+        "Headless Chromium" => Some("managed-headless"),
+        "Managed Chromium" => Some("managed-headed"),
+        "Local Chrome" => Some("local"),
+        _ => None,
+    }
 }
 
 fn dispatch_browser_script_tool(
@@ -5115,6 +5400,50 @@ fn record_tool_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_preference_commands_persist_mode_and_domain_profile() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let output =
+            dispatch_browser_preference_command(&store, &session, "browser preference use cloud")?
+                .expect("preference command");
+        assert_eq!(output["status"], "ok");
+        assert_eq!(
+            store.get_setting(BROWSER_PREF_MODE)?.as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            store.get_setting("browser")?.as_deref(),
+            Some("Browser Use cloud")
+        );
+        assert_eq!(
+            resolve_browser_connect_command(&store, "browser connect")?,
+            "browser remote start"
+        );
+
+        let output = dispatch_browser_preference_command(
+            &store,
+            &session,
+            "browser profile remember --domain https://www.gusto.com/ --profile google-chrome:Profile-2 --mode local",
+        )?
+        .expect("profile command");
+        assert_eq!(output["status"], "ok");
+        assert_eq!(output["remembered"]["domain"], "gusto.com");
+        assert_eq!(
+            remembered_domain_profile(&store, "gusto.com")?
+                .and_then(|value| value["profile_id"].as_str().map(ToOwned::to_owned))
+                .as_deref(),
+            Some("google-chrome:Profile-2")
+        );
+        assert_eq!(
+            resolve_browser_connect_command(&store, "connect")?,
+            "browser connect local"
+        );
+        Ok(())
+    }
 
     #[test]
     fn fake_agent_can_run_python_and_finish() -> Result<()> {

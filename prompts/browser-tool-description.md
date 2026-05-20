@@ -6,9 +6,15 @@ The input is a single CLI-like command string. You may include the leading word 
 
 ```text
 browser status --json
+browser preference --json
+browser preference use local
+browser profile suggest --domain gusto.com --json
+browser profile remember --domain gusto.com --profile google-chrome:Profile 2
+browser connect
 browser connect local
 browser local list --json
 browser local setup
+browser local setup --profile google-chrome:Profile 2
 browser connect managed --headed
 browser remote start --profile-name Work
 browser recover reconnect-websocket
@@ -22,12 +28,22 @@ Mental model:
 - Python in `browser_script` is fresh per call; Python variables do not persist.
 - Nothing reloads, relaunches, closes, or switches tabs silently. If IDs may change, this tool reports that and you choose the next action.
 
+Preferences:
+
+- `browser preference --json` shows the remembered browser mode/profile preferences.
+- `browser preference use local|cloud|managed-headless|managed-headed` changes what plain `browser connect` means.
+- `browser profile suggest --domain <domain> --json` lists remembered and local profile options for a site.
+- `browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud]` stores the profile to use next time for that domain.
+- If a site likely needs login and no profile is remembered, ask the user which profile/browser to use before connecting.
+- Do not silently attach to a different local profile when a profile is remembered.
+
 Local real browser:
 
 - `browser connect local` attaches to an already-running Chromium-family browser after the user enables remote debugging.
 - Do not guess a browser family flag. The tool auto-detects Chrome, Chrome Canary, Chromium, Edge, Brave, Arc, Dia, Comet, and common forks through DevToolsActivePort.
 - If one candidate exists, it connects. If multiple candidates exist, ask the user which candidate to use, then run `browser connect local --candidate <id>`.
-- If Chrome blocks the connection, run `browser local setup`. The user must enable `chrome://inspect/#remote-debugging` and accept any Chrome permission prompt. Then run `browser connect local` again.
+- If Chrome blocks the connection with permission evidence such as 403, run `browser local setup`. The user must enable `chrome://inspect/#remote-debugging` and accept any Chrome permission prompt. Then run `browser connect local` again.
+- If the port is closed or `DevToolsActivePort` is stale, Chrome is not exposing CDP right now. Do not tell the user remote debugging is disabled; ask them to open Chrome with the selected profile, or run `browser local setup --profile <profile-id>` if profile is known.
 - Do not launch the user's real default Chrome profile with remote-debugging flags. Real logged-in profiles are attached while already open.
 
 Local profiles:
@@ -76,6 +92,14 @@ browser status --json
 browser doctor
 browser doctor --json
 
+browser preference --json
+browser preference use local|cloud|managed-headless|managed-headed
+browser profile suggest --domain <domain> --json
+browser profile use <profile-id>
+browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud|managed-headless]
+browser profile forget --domain <domain>
+
+browser connect
 browser connect local
 browser connect local --candidate <id>
 browser connect managed [--headless|--headed] [--profile temp|<path>] [--arg <chrome-arg>...]
@@ -83,7 +107,7 @@ browser connect remote-cdp --url <http-url>
 browser connect remote-cdp --ws <ws-url>
 
 browser local list --json
-browser local setup
+browser local setup [--profile <profile-id>]
 browser local profiles --json
 browser local profiles inspect <profile-id-or-name> --domains-only
 
