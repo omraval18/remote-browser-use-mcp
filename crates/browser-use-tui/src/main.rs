@@ -1055,6 +1055,10 @@ impl App {
             // to its filter (printable ASCII only — control sequences fall
             // through to other handlers). Backspace pops a character; the
             // popup stays open even when the filter is empty.
+            KeyEvent { .. } if self.is_slash_palette_active() && is_command_delete_key(key) => {
+                self.palette_filter.clear();
+                self.clamp_slash_palette_selection();
+            }
             KeyEvent {
                 code: KeyCode::Char(ch),
                 modifiers,
@@ -2311,6 +2315,12 @@ fn handle_escape_prefix_key(
     app.handle_key(escape_key)
 }
 
+fn is_command_delete_key(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+        && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+}
+
 fn is_unmodified_enter_event(event: &TermEvent) -> bool {
     matches!(
         event,
@@ -3238,6 +3248,33 @@ mod redesign_tests {
             .enumerate()
             .any(|(idx, line)| idx > input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER))?);
+        assert_eq!(app.palette_filter(), "");
+        let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> ");
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx > input_row && line.contains("/task")));
+        assert!(screen.contains("/history"));
+        Ok(())
+    }
+
+    #[test]
+    fn popup_text_inputs_handle_command_delete() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.open_surface(Surface::Account);
+        app.selected_row = 4;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ApiKey);
+        for ch in "sk-or-v1-test".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.composer.input(), "sk-or-v1-test");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::META))?);
+        assert_eq!(app.composer.input(), "");
+        assert_eq!(app.surface, Surface::ApiKey);
         Ok(())
     }
 
