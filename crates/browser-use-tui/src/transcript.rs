@@ -3,12 +3,14 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::render_markdown_lines;
+use crate::markdown::{highlight_code_line_spans, render_markdown_lines};
 use crate::theme::{
-    dim, failed, link, muted, text_style, thought, user_prompt_accent, user_prompt_text,
+    dim, failed, link, muted, running, text_style, thought, user_prompt_accent, user_prompt_text,
 };
 
 use super::App;
+
+const ACTIVE_LIVE_LINE_LIMIT: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
@@ -781,7 +783,7 @@ fn active_node_for_session(
         {
             lines.push(wait_agent_started_label(&wait_event.payload));
         }
-        let recent = recent_child_activity_lines(app, state, &child.id, 6);
+        let recent = recent_child_activity_lines(app, state, &child.id, ACTIVE_LIVE_LINE_LIMIT);
         if recent.is_empty() {
             if lines.len() == 1 {
                 lines.push("waiting for activity".to_string());
@@ -837,7 +839,7 @@ fn active_node_for_session(
             &label
                 .map(|label| format!("thought {label}"))
                 .unwrap_or_else(|| "thought".to_string()),
-            preview_lines(text, 5),
+            preview_lines(text, ACTIVE_LIVE_LINE_LIMIT),
             NodeStyle::Thought,
         ));
     }
@@ -1222,21 +1224,257 @@ fn grouped_lines(
     let content_width = width.saturating_sub(2).max(1);
     for value in values {
         for (_, wrapped) in wrap_plain(value, content_width) {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                styled_value(&wrapped, value_style),
-            ]));
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(styled_value_spans(group, &wrapped, value_style));
+            lines.push(Line::from(spans));
         }
     }
     lines
 }
 
-fn styled_value(text: &str, fallback: Style) -> Span<'static> {
+fn styled_value_spans(group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
     if text.starts_with("https://") || text.starts_with("http://") {
-        Span::styled(text.to_string(), link())
-    } else {
-        Span::styled(text.to_string(), fallback)
+        return vec![Span::styled(text.to_string(), link())];
     }
+    if group == "run" && looks_like_shell_line(text) {
+        if let Some(spans) = highlight_code_line_spans(text, Some("bash")) {
+            return spans;
+        }
+    }
+    if let Some(spans) = styled_activity_line_spans(text, fallback) {
+        return spans;
+    }
+    styled_path_tokens(text, fallback)
+}
+
+fn styled_activity_line_spans(text: &str, fallback: Style) -> Option<Vec<Span<'static>>> {
+    let (leading, action, rest) = split_activity_line(text)?;
+    if action == "run" && looks_like_command_line(rest) {
+        let mut spans = Vec::new();
+        if !leading.is_empty() {
+            spans.push(Span::styled(leading.to_string(), fallback));
+        }
+        spans.push(Span::styled(
+            action.to_string(),
+            activity_action_style(action),
+        ));
+        spans.push(Span::styled(" ".to_string(), fallback));
+        if let Some(command_spans) = highlight_code_line_spans(rest, Some("bash")) {
+            spans.extend(command_spans);
+        } else {
+            spans.extend(styled_path_tokens(rest, fallback));
+        }
+        return Some(spans);
+    }
+
+    if matches!(
+        action,
+        "read"
+            | "list"
+            | "search"
+            | "task"
+            | "follow-up"
+            | "waiting"
+            | "working"
+            | "artifact"
+            | "command"
+    ) {
+        let mut spans = Vec::new();
+        if !leading.is_empty() {
+            spans.push(Span::styled(leading.to_string(), fallback));
+        }
+        spans.push(Span::styled(
+            action.to_string(),
+            activity_action_style(action),
+        ));
+        if !rest.is_empty() {
+            spans.push(Span::styled(" ".to_string(), fallback));
+            spans.extend(styled_path_tokens(rest, fallback));
+        }
+        return Some(spans);
+    }
+
+    None
+}
+
+fn split_activity_line(text: &str) -> Option<(&str, &str, &str)> {
+    let leading_len = text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let leading = &text[..leading_len];
+    let body = &text[leading_len..];
+    if body.is_empty() {
+        return None;
+    }
+    if body == "working" {
+        return Some((leading, body, ""));
+    }
+    let (action, rest) = body.split_once(' ')?;
+    Some((leading, action, rest))
+}
+
+fn activity_action_style(action: &str) -> Style {
+    match action {
+        "run" | "read" | "list" | "search" | "artifact" | "command" => running(),
+        "working" | "waiting" => thought(),
+        "task" | "follow-up" => user_prompt_accent(),
+        _ => group_style(NodeStyle::Normal),
+    }
+}
+
+fn styled_path_tokens(text: &str, fallback: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut token_start = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                push_maybe_path_token(&mut spans, &text[start..idx], fallback);
+            }
+            spans.push(Span::styled(ch.to_string(), fallback));
+        } else if token_start.is_none() {
+            token_start = Some(idx);
+        }
+    }
+    if let Some(start) = token_start {
+        push_maybe_path_token(&mut spans, &text[start..], fallback);
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), fallback));
+    }
+    spans
+}
+
+fn push_maybe_path_token(spans: &mut Vec<Span<'static>>, token: &str, fallback: Style) {
+    let leading = token
+        .chars()
+        .take_while(|ch| matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{' | '<'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let trailing = token
+        .chars()
+        .rev()
+        .take_while(|ch| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ':' | ';'
+            )
+        })
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let core_end = token.len().saturating_sub(trailing);
+    if leading >= core_end {
+        spans.push(Span::styled(token.to_string(), fallback));
+        return;
+    }
+    let (prefix, rest) = token.split_at(leading);
+    let (core, suffix) = rest.split_at(core_end - leading);
+    if looks_like_path_token(core) {
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix.to_string(), fallback));
+        }
+        spans.push(Span::styled(core.to_string(), link()));
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix.to_string(), fallback));
+        }
+    } else {
+        spans.push(Span::styled(token.to_string(), fallback));
+    }
+}
+
+fn looks_like_command_line(text: &str) -> bool {
+    matches!(
+        text.trim_start()
+            .trim_start_matches("$ ")
+            .split_whitespace()
+            .next(),
+        Some(
+            "cargo"
+                | "git"
+                | "rg"
+                | "grep"
+                | "find"
+                | "sed"
+                | "awk"
+                | "cat"
+                | "ls"
+                | "cd"
+                | "pwd"
+                | "uv"
+                | "python"
+                | "python3"
+                | "node"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "bun"
+                | "curl"
+                | "ssh"
+                | "docker"
+                | "task"
+                | "sqlite3"
+        )
+    )
+}
+
+fn looks_like_shell_line(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    looks_like_command_line(trimmed)
+        || trimmed.starts_with('|')
+        || trimmed.starts_with("&&")
+        || trimmed.starts_with("||")
+        || trimmed.contains(" | ")
+        || trimmed.contains(" && ")
+        || trimmed.contains(" || ")
+        || trimmed.contains(" > ")
+        || trimmed.contains(" < ")
+}
+
+fn looks_like_path_token(token: &str) -> bool {
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return true;
+    }
+    let has_path_character = token
+        .chars()
+        .any(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    token.starts_with('/')
+        || (has_path_character
+            && (token.starts_with("~/") || token.starts_with("./") || token.starts_with("../")))
+        || source_extension(token).is_some()
+}
+
+fn source_extension(token: &str) -> Option<&str> {
+    let extension = token.rsplit_once('.')?.1;
+    matches!(
+        extension,
+        "rs" | "toml"
+            | "lock"
+            | "md"
+            | "py"
+            | "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "css"
+            | "scss"
+            | "html"
+            | "sql"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "txt"
+            | "log"
+            | "xml"
+            | "svg"
+            | "diff"
+            | "patch"
+    )
+    .then_some(extension)
 }
 
 fn group_style(style: NodeStyle) -> Style {
@@ -1769,5 +2007,86 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains("https://") && span.style == link())
         }));
+    }
+
+    #[test]
+    fn run_values_highlight_commands_and_paths() {
+        let command_spans = styled_value_spans(
+            "run",
+            "find crates -maxdepth 3 -type f | sort",
+            text_style(),
+        );
+        assert!(command_spans.iter().any(|span| {
+            span.content.as_ref() == "find"
+                && span
+                    .style
+                    .fg
+                    .is_some_and(|color| color != crate::theme::text())
+        }));
+
+        let path_spans = styled_value_spans(
+            "run",
+            "crates/browser-use-tui/src/markdown.rs",
+            text_style(),
+        );
+        assert!(path_spans
+            .iter()
+            .any(|span| span.content.contains("markdown.rs") && span.style == link()));
+    }
+
+    #[test]
+    fn nested_activity_run_lines_highlight_commands() {
+        let spans = styled_value_spans(
+            "subagent repo explorer",
+            "run pwd && find . -maxdepth 2 -type f | sed 's# ./##' | sort | head -200",
+            text_style(),
+        );
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "run" && span.style == running()));
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "find"
+                && span
+                    .style
+                    .fg
+                    .is_some_and(|color| color != crate::theme::text())
+        }));
+        assert!(!spans
+            .iter()
+            .any(|span| span.content.contains("./##") && span.style == link()));
+    }
+
+    #[test]
+    fn prose_slash_tokens_do_not_become_paths() {
+        let spans = styled_value_spans(
+            "subagent repo explorer",
+            "task Inspect the repo: languages/frameworks...",
+            text_style(),
+        );
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "task" && span.style == user_prompt_accent()));
+        assert!(!spans
+            .iter()
+            .any(|span| span.content.contains("languages/frameworks") && span.style == link()));
+    }
+
+    #[test]
+    fn child_activity_state_words_are_highlighted() {
+        for (line, expected_style) in [
+            ("working", thought()),
+            ("waiting for gpt-5.5", thought()),
+            ("list .", running()),
+            ("read Taskfile.yml", running()),
+        ] {
+            let spans = styled_value_spans("subagent repo explorer", line, text_style());
+            let action = line.split_whitespace().next().unwrap_or(line);
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == action && span.style == expected_style),
+                "{line:?} did not highlight {action:?}"
+            );
+        }
     }
 }

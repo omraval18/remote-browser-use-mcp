@@ -22,8 +22,6 @@ pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
 const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
 pub(crate) const NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN: u16 =
     APP_HORIZONTAL_MARGIN + CONTENT_HORIZONTAL_MARGIN;
-const COMPOSER_HINT_GAP: u16 = 1;
-
 pub(crate) fn render_dump(app: &mut App) -> Result<String> {
     app.drain_store_notifications()?;
     let backend = TestBackend::new(app.args.width, app.args.height);
@@ -92,7 +90,8 @@ pub(crate) fn lines_plain_text(lines: &[Line<'static>]) -> String {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
-    let area = app_surface(frame.area());
+    let full_area = frame.area();
+    let area = app_surface(full_area);
     let state = app
         .workbench_state()
         .unwrap_or_else(|_| app.empty_workbench_state_with_failure());
@@ -112,12 +111,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.surface {
         surface if surface.is_popup() => {
             render_main(frame, area, app, &state, product_state);
-            render_popup_overlay(frame, area, app, &state, surface);
+            render_popup_overlay(frame, full_area, app, &state, surface);
         }
         surface if surface.uses_main_view() => {
-            render_main(frame, area, app, &state, product_state);
             if app.is_slash_palette_active() {
-                render_command_palette_popup(frame, area, app);
+                render_main(frame, area, app, &state, product_state);
+                render_command_palette_popup(frame, full_area, app);
+            } else {
+                render_main(frame, area, app, &state, product_state);
             }
         }
         surface => render_surface(frame, area, app, &state, surface),
@@ -160,7 +161,8 @@ fn render_main(
     };
     let bottom_h = main_bottom_height_for(app, state, layout_surface, area, product_state);
     let body_width = content_width(area.width);
-    let native_scrollback_active = app.native_scrollback_is_active();
+    let modal_overlay_active = app.surface.is_popup() || app.is_slash_palette_active();
+    let native_scrollback_active = app.native_scrollback_is_active() && !modal_overlay_active;
     let show_footer = layout_surface.is_bottom_pane()
         || app
             .quit_hint_until
@@ -197,8 +199,15 @@ fn render_main(
     };
     let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active)
         && !layout_surface.is_bottom_pane();
-    let (body_area, bottom_area, footer_area) =
-        main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
+    let attach_bottom_to_body = native_scrollback_active && !layout_surface.is_bottom_pane();
+    let (body_area, bottom_area, footer_area) = main_layout_areas(
+        area,
+        bottom_h,
+        body.len(),
+        show_footer,
+        pin_bottom,
+        attach_bottom_to_body,
+    );
     let mut body = body;
     if body.len() > body_area.height as usize {
         body = visible_main_body_lines(body, body_area.height, product_state);
@@ -233,10 +242,11 @@ fn render_main(
     trim_trailing_whitespace(&mut body);
     let body_content_rect = content_area(body_render_area);
     if matches!(product_state, ProductState::Ready) && app.is_welcome_surface() {
-        app.welcome_logo_rect.set(Some(crate::welcome::logo_screen_rect(
-            body_content_rect,
-            app.status_notice.is_some(),
-        )));
+        app.welcome_logo_rect
+            .set(Some(crate::welcome::logo_screen_rect(
+                body_content_rect,
+                app.status_notice.is_some(),
+            )));
     } else {
         app.welcome_logo_rect.set(None);
     }
@@ -267,30 +277,57 @@ fn main_layout_areas(
     body_len: usize,
     show_footer: bool,
     pin_bottom: bool,
+    attach_bottom_to_body: bool,
 ) -> (Rect, Rect, Rect) {
     let footer_h = u16::from(show_footer && area.height > bottom_h);
     let max_body_h = area
         .height
         .saturating_sub(bottom_h)
         .saturating_sub(footer_h);
-    let body_h = if pin_bottom {
-        max_body_h
+    let body_h = (body_len as u16).min(max_body_h);
+    // The composer is always pinned to the bottom of the terminal; the
+    // optional footer is the very last row. The body either sits at the
+    // top with a flex spacer pushing the composer down (welcome / setup),
+    // or sits at the bottom just above the composer with the spacer
+    // above it so it grows downward toward the composer as content
+    // arrives (active sessions).
+    let chunks = if pin_bottom {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(body_h),
+                Constraint::Length(bottom_h),
+                Constraint::Length(footer_h),
+            ])
+            .split(area)
+    } else if attach_bottom_to_body {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(body_h),
+                Constraint::Length(bottom_h),
+                Constraint::Fill(1),
+                Constraint::Length(footer_h),
+            ])
+            .split(area)
     } else {
-        (body_len as u16).min(max_body_h)
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(body_h),
+                Constraint::Fill(1),
+                Constraint::Length(bottom_h),
+                Constraint::Length(footer_h),
+            ])
+            .split(area)
     };
-    // Body sits at the top of the area; the composer is pinned to the
-    // bottom of the terminal with a flex spacer between them; the
-    // optional footer is the very last row.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(body_h),
-            Constraint::Min(0),
-            Constraint::Length(bottom_h),
-            Constraint::Length(footer_h),
-        ])
-        .split(area);
-    (chunks[0], chunks[2], chunks[3])
+    if attach_bottom_to_body && !pin_bottom {
+        (chunks[0], chunks[1], chunks[3])
+    } else {
+        let body_idx = if pin_bottom { 1 } else { 0 };
+        (chunks[body_idx], chunks[2], chunks[3])
+    }
 }
 
 fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active: bool) -> bool {
@@ -299,7 +336,10 @@ fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active:
     }
     matches!(
         product_state,
-        ProductState::Running | ProductState::Failed | ProductState::Cancelled
+        ProductState::Running
+            | ProductState::Result
+            | ProductState::Failed
+            | ProductState::Cancelled
     )
 }
 
@@ -320,8 +360,8 @@ fn main_bottom_height_for(
     if !surface.is_bottom_pane() {
         return composer_pane_height(app, product_state, area.width);
     }
-    let line_count = surface_lines(surface, app, state, content_width(area.width) as usize)
-        .len() as u16;
+    let line_count =
+        surface_lines(surface, app, state, content_width(area.width) as usize).len() as u16;
     let max_height = match surface {
         Surface::Model | Surface::History => area.height.saturating_sub(2).max(6),
         Surface::BrowserSelect => 22,
@@ -339,10 +379,6 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     visual_input_lines + 3
 }
 
-fn composer_input_area_width(width: u16) -> u16 {
-    width.saturating_sub(4).max(1)
-}
-
 /// Visual rows the input area inside the fused composer should occupy.
 /// Floored at 3 so the box has comfortable breathing room when empty, and
 /// capped at 10 so a long pasted prompt doesn't push the rest of the UI
@@ -355,18 +391,6 @@ fn composer_visual_input_lines(app: &App, input_area_width: u16) -> u16 {
         .composer
         .visual_line_count_wrapped(input_area_width as usize) as u16;
     visual_input_lines.clamp(COMPOSER_INPUT_MIN_ROWS, COMPOSER_INPUT_MAX_ROWS)
-}
-
-/// Number of dropdown item rows the slash palette would render (0 when the
-/// palette is closed). The fused composer absorbs its own chrome — top
-/// border, separator, hint — so this is just the row count, not a pane
-/// height including borders.
-fn slash_palette_pane_height(app: &App) -> u16 {
-    if !app.is_slash_palette_active() {
-        return 0;
-    }
-    let items = app.slash_palette_items();
-    (items.len() as u16).min(8)
 }
 
 fn render_bottom_pane(
@@ -440,7 +464,9 @@ fn render_popup_overlay(
 
     // Estimate desired height from body content length + chrome
     // (border 2 + header 4 + footer 2 = 8 lines).
-    let body_inner_width = popup_w.saturating_sub(2 + CONTENT_HORIZONTAL_MARGIN * 2).max(1) as usize;
+    let body_inner_width = popup_w
+        .saturating_sub(2 + CONTENT_HORIZONTAL_MARGIN * 2)
+        .max(1) as usize;
     let body_line_count = surface_lines(surface, app, state, body_inner_width).len() as u16;
     let desired_h = body_line_count.saturating_add(8);
 
@@ -480,7 +506,10 @@ fn render_popup_overlay(
     let header_h = (header.len() as u16).min(inner.height);
     let footer_text = surface_footer(surface);
     let footer_h: u16 = if footer_text.is_empty() { 0 } else { 1 };
-    let body_h = inner.height.saturating_sub(header_h).saturating_sub(footer_h);
+    let body_h = inner
+        .height
+        .saturating_sub(header_h)
+        .saturating_sub(footer_h);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -516,17 +545,21 @@ fn render_popup_overlay(
         let target = format!("  {masked}");
         let cursor_col = target.chars().count() as u16;
         let visible_h = body_area.height as usize;
-        lines.iter().take(visible_h).enumerate().find_map(|(row, line)| {
-            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            if plain.starts_with(&target) {
-                Some((
-                    body_area.x.saturating_add(cursor_col.min(body_area.width)),
-                    body_area.y.saturating_add(row as u16),
-                ))
-            } else {
-                None
-            }
-        })
+        lines
+            .iter()
+            .take(visible_h)
+            .enumerate()
+            .find_map(|(row, line)| {
+                let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if plain.starts_with(&target) {
+                    Some((
+                        body_area.x.saturating_add(cursor_col.min(body_area.width)),
+                        body_area.y.saturating_add(row as u16),
+                    ))
+                } else {
+                    None
+                }
+            })
     } else {
         None
     };
@@ -551,10 +584,10 @@ fn render_popup_overlay(
     }
 }
 
-/// Floating command palette: appears the moment the composer starts with
-/// `/`, listing all slash commands (filtered by what the user has typed
-/// after the slash). Centered horizontally, anchored just above the
-/// composer so it reads as the dropdown for the input below.
+/// Floating command palette: appears the moment the user presses `/`, listing
+/// all slash commands filtered by what they type next. It is a true modal over
+/// the full terminal frame; the underlying transcript/composer is hidden while
+/// the palette owns input.
 fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -564,6 +597,7 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     const MIN_H: u16 = 10;
     const MAX_W: u16 = 72;
     const H_MARGIN: u16 = 4;
+    const V_MARGIN: u16 = 2;
 
     let items = app.slash_palette_items();
     let item_count = items.len() as u16;
@@ -583,14 +617,13 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .min(MAX_W)
             .max(MIN_W)
     };
-    let composer_h = composer_pane_height(app, ProductState::Ready, area.width);
-    let composer_top = area.y + area.height.saturating_sub(composer_h);
-    // Cap height so the popup never overlaps the composer below.
-    let available_h = composer_top.saturating_sub(area.y).saturating_sub(1).max(MIN_H);
+    let available_h = area
+        .height
+        .saturating_sub(V_MARGIN.saturating_mul(2))
+        .max(MIN_H.min(area.height));
     let popup_h = desired_h.min(available_h).max(MIN_H.min(available_h));
     let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
-    // Anchor to just above the composer.
-    let popup_y = composer_top.saturating_sub(popup_h).saturating_sub(1).max(area.y);
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
     let popup_rect = Rect {
         x: popup_x,
         y: popup_y,
@@ -642,7 +675,9 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor_offset = typed.chars().count() as u16;
     if input_inner.width > 0 {
         frame.set_cursor_position(Position {
-            x: input_inner.x.saturating_add(cursor_offset.min(input_inner.width)),
+            x: input_inner
+                .x
+                .saturating_add(cursor_offset.min(input_inner.width)),
             y: input_inner.y,
         });
     }
@@ -653,10 +688,7 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  No commands match.",
-                muted(),
-            ))),
+            Paragraph::new(Line::from(Span::styled("  No commands match.", muted()))),
             body_chunk,
         );
     } else {
@@ -905,7 +937,11 @@ fn render_composer(
             horizontal: 2,
         });
         frame.render_widget(
-            Paragraph::new(composer_status_line(app, state, status_inner.width as usize)),
+            Paragraph::new(composer_status_line(
+                app,
+                state,
+                status_inner.width as usize,
+            )),
             status_inner,
         );
     }
@@ -956,245 +992,6 @@ fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Lin
     Line::from(spans)
 }
 
-/// Build the top border line for the fused composer. Punches one tag
-/// through it: `/ command palette` when the palette is open, otherwise the
-/// model + browser metadata. Each tag is dropped or shortened to fit when
-/// the terminal narrows.
-fn top_border_line(width: u16, app: &App, palette_open: bool) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled("╭", border()));
-    let inner_w = width.saturating_sub(2) as usize;
-    if palette_open {
-        let mut tag_spans = vec![
-            Span::raw(" "),
-            Span::styled("/", accent()),
-            Span::styled(" command palette ", muted()),
-        ];
-        let tag_w: usize = tag_spans.iter().map(|s| s.content.chars().count()).sum();
-        // 2-cell dash lead-in before the tag, fill the rest with dashes.
-        let lead = 2usize.min(inner_w.saturating_sub(tag_w));
-        spans.push(Span::styled("─".repeat(lead), border()));
-        spans.append(&mut tag_spans);
-        let trail = inner_w.saturating_sub(lead + tag_w);
-        spans.push(Span::styled("─".repeat(trail), border()));
-    } else {
-        let tag = top_metadata_spans(app, inner_w);
-        let tag_w: usize = tag.iter().map(|s| s.content.chars().count()).sum();
-        // Right-align the metadata tag: dashes, then tag, then 2-dash trail.
-        let trail = 2usize.min(inner_w.saturating_sub(tag_w));
-        let lead = inner_w.saturating_sub(tag_w + trail);
-        spans.push(Span::styled("─".repeat(lead), border()));
-        spans.extend(tag);
-        spans.push(Span::styled("─".repeat(trail), border()));
-    }
-    spans.push(Span::styled("╮", border()));
-    Line::from(spans)
-}
-
-/// Build the bottom border line. Always shows cwd on the left and branch on
-/// the right (when there is one). When the palette has displaced the
-/// model/browser tag off the top, the bottom takes it too — inserted between
-/// cwd and branch.
-fn bottom_border_line(width: u16, app: &App, palette_open: bool) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled("╰", border()));
-    let inner_w = width.saturating_sub(2) as usize;
-
-    let mut left_spans = bottom_left_spans();
-    let mut right_spans = bottom_right_spans();
-    let mut center_spans: Vec<Span<'static>> = Vec::new();
-    if palette_open {
-        center_spans = top_metadata_spans(app, inner_w);
-    }
-
-    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-    let center_w: usize = center_spans.iter().map(|s| s.content.chars().count()).sum();
-
-    // Floor: 2-cell dash lead-in on the left, 2 between segments. If we can't
-    // fit a segment we drop it, smallest-priority first: branch, then
-    // center (palette-displaced metadata), then cwd.
-    let needed = |segments: &[usize]| -> usize {
-        let dashes = 2 + segments.len().saturating_sub(1) * 2 + 2; // lead + gaps + trail
-        segments.iter().sum::<usize>() + dashes
-    };
-
-    // Build present segments list (left, optional center, optional right).
-    let mut segments: Vec<Vec<Span<'static>>> = vec![left_spans.clone()];
-    if !center_spans.is_empty() {
-        segments.push(center_spans.clone());
-    }
-    if !right_spans.is_empty() {
-        segments.push(right_spans.clone());
-    }
-    let widths: Vec<usize> = segments
-        .iter()
-        .map(|s| s.iter().map(|sp| sp.content.chars().count()).sum())
-        .collect();
-    let mut drop_right = false;
-    let mut drop_center = false;
-    let mut drop_left = false;
-    if needed(&widths) > inner_w {
-        // Drop the rightmost-priority segment first.
-        if widths.len() == 3 {
-            drop_right = true;
-            let trimmed: Vec<usize> = widths[..2].to_vec();
-            if needed(&trimmed) > inner_w {
-                drop_center = true;
-                let trimmed2: Vec<usize> = vec![widths[0]];
-                if needed(&trimmed2) > inner_w {
-                    drop_left = true;
-                }
-            }
-        } else if widths.len() == 2 {
-            drop_right = true;
-            if needed(&[widths[0]]) > inner_w {
-                drop_left = true;
-            }
-        } else if widths.len() == 1 && needed(&widths) > inner_w {
-            drop_left = true;
-        }
-    }
-    if drop_right {
-        right_spans.clear();
-    }
-    if drop_center {
-        center_spans.clear();
-    }
-    if drop_left {
-        left_spans.clear();
-    }
-
-    let left_w = left_spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-    let right_w = right_spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-    let center_w = center_spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-
-    // Layout: [lead dashes] [left] [mid dashes] [center] [mid dashes] [right] [trail dashes]
-    // collapse missing segments and their dash gaps.
-    let lead = 2.min(inner_w.saturating_sub(left_w + center_w + right_w));
-    spans.push(Span::styled("─".repeat(lead), border()));
-    let mut used = lead;
-    if !left_spans.is_empty() {
-        spans.extend(left_spans.clone());
-        used += left_w;
-    }
-    if !center_spans.is_empty() {
-        let gap = inner_w
-            .saturating_sub(used + center_w + right_w + 2)
-            .min(usize::MAX);
-        let gap = gap.max(2);
-        spans.push(Span::styled("─".repeat(gap), border()));
-        spans.extend(center_spans.clone());
-        used += gap + center_w;
-    }
-    if !right_spans.is_empty() {
-        let gap = inner_w.saturating_sub(used + right_w + 2).max(2);
-        spans.push(Span::styled("─".repeat(gap), border()));
-        spans.extend(right_spans.clone());
-        used += gap + right_w;
-    }
-    let trail = inner_w.saturating_sub(used);
-    spans.push(Span::styled("─".repeat(trail), border()));
-    spans.push(Span::styled("╯", border()));
-    Line::from(spans)
-}
-
-/// The dashed separator that sits between the slash-command dropdown and the
-/// input area when the palette is open. `├╌╌...╌╌┤` so the box reads as one
-/// continuous frame split into two halves.
-fn separator_line(width: u16) -> Line<'static> {
-    let inner = width.saturating_sub(2) as usize;
-    Line::from(vec![
-        Span::styled("├", border()),
-        Span::styled("╌".repeat(inner), border()),
-        Span::styled("┤", border()),
-    ])
-}
-
-/// Model + browser, in their warm/cool accent colors, separated by a muted
-/// `·`. Used on the top edge by default, or on the bottom edge when the
-/// palette has taken over the top.
-fn top_metadata_spans(app: &App, max_width: usize) -> Vec<Span<'static>> {
-    let model = short_model(&app.model);
-    let browser = short_browser(&app.browser);
-    let model_color = Style::default().fg(ratatui::style::Color::Rgb(251, 191, 36));
-    let browser_color = Style::default().fg(ratatui::style::Color::Rgb(96, 165, 250));
-    let full = vec![
-        Span::raw(" "),
-        Span::styled(model.clone(), model_color),
-        Span::styled(" · ", muted()),
-        Span::styled(browser.clone(), browser_color),
-        Span::raw(" "),
-    ];
-    let full_w: usize = full.iter().map(|s| s.content.chars().count()).sum();
-    if full_w + 4 <= max_width {
-        return full;
-    }
-    // Tight: drop the browser, keep just the model.
-    let model_only = vec![Span::raw(" "), Span::styled(model.clone(), model_color), Span::raw(" ")];
-    let model_w: usize = model_only.iter().map(|s| s.content.chars().count()).sum();
-    if model_w + 4 <= max_width {
-        return model_only;
-    }
-    Vec::new()
-}
-
-fn bottom_left_spans() -> Vec<Span<'static>> {
-    let cwd = short_cwd(&cwd_label());
-    vec![Span::raw(" "), Span::styled(cwd, muted()), Span::raw(" ")]
-}
-
-fn bottom_right_spans() -> Vec<Span<'static>> {
-    if let Some(branch) = git_branch() {
-        let branch_color = Style::default().fg(ratatui::style::Color::Rgb(192, 132, 252));
-        vec![
-            Span::raw(" "),
-            Span::styled("⎇ ", muted()),
-            Span::styled(branch, branch_color),
-            Span::raw(" "),
-        ]
-    } else {
-        Vec::new()
-    }
-}
-
-/// Compact display name for the model, used on the input border.
-fn short_model(model: &str) -> String {
-    if model.is_empty() {
-        return "—".to_string();
-    }
-    model.to_string()
-}
-
-/// Compact display name for the browser backend.
-fn short_browser(browser: &str) -> String {
-    if browser.is_empty() {
-        return "—".to_string();
-    }
-    browser.to_string()
-}
-
-/// Path string for the bottom-left of the input. Replaces the home prefix
-/// with `~` and, if the path is still long, keeps the last two path
-/// components with a leading ellipsis.
-fn short_cwd(cwd: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let with_tilde = if !home.is_empty() && cwd.starts_with(&home) {
-        format!("~{}", &cwd[home.len()..])
-    } else {
-        cwd.to_string()
-    };
-    if with_tilde.chars().count() <= 48 {
-        return with_tilde;
-    }
-    let parts: Vec<&str> = with_tilde.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() <= 2 {
-        return with_tilde;
-    }
-    let tail = parts[parts.len() - 2..].join("/");
-    format!("…/{tail}")
-}
-
 /// Dropdown rows used by the fused composer. No top/bottom rules and no
 /// hint footer — those are provided by the box around it. Each row is
 /// `marker · command · description` with the marker column reserved for the
@@ -1231,10 +1028,6 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn input_box_rule(width: u16) -> String {
-    "─".repeat(width as usize)
-}
-
 /// Token budget the context bar fills toward. `browser-use-core` compacts the
 /// conversation at `max_context_chars` (240_000) / `APPROX_CHARS_PER_TOKEN` (4),
 /// so the agent operates within ~60k tokens regardless of the underlying model.
@@ -1242,24 +1035,6 @@ const CONTEXT_BUDGET_TOKENS: i64 = 60_000;
 
 /// Width, in cells, of the filled/empty context bar.
 const CONTEXT_BAR_WIDTH: usize = 10;
-
-/// Compact Claude-Code-style status bar rendered as the composer footer:
-/// the active model, a context-fill bar, and accumulated session cost.
-fn status_bar_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
-    let usage = session_usage(app, state);
-    let mut spans = vec![Span::styled(app.model.clone(), accent())];
-    spans.push(status_separator());
-    spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
-    if let Some(branch) = git_branch() {
-        spans.push(status_separator());
-        spans.push(Span::styled(branch, done()));
-    }
-    if usage.cost_usd > 0.0 {
-        spans.push(status_separator());
-        spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
-    }
-    Line::from(spans)
-}
 
 /// A plain context bar — solid `█` fill over a `░` track — followed by the
 /// `used/budget` token counts. Turns red as the conversation nears the
@@ -1375,49 +1150,6 @@ fn format_token_count(tokens: i64) -> String {
     } else {
         format!("{thousands:.1}k")
     }
-}
-
-/// Command key hints shown in the composer footer on the home screen, where
-/// there is no active session and therefore no usage data to surface.
-fn hint_row(width: usize) -> Line<'static> {
-    let hints = [
-        ("Enter", "send"),
-        ("Tab", "history"),
-        ("/", "commands"),
-        ("Esc", "clear"),
-    ];
-    let mut spans = Vec::new();
-    for (idx, (key, action)) in hints.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled(" | ", dim()));
-        }
-        let text_len = key.chars().count() + action.chars().count() + 1;
-        let used: usize = spans
-            .iter()
-            .map(|span: &Span<'_>| span.content.chars().count())
-            .sum();
-        if used + text_len > width {
-            break;
-        }
-        spans.push(Span::styled((*key).to_string(), bold()));
-        spans.push(Span::styled(":".to_string(), dim()));
-        spans.push(Span::styled((*action).to_string(), muted()));
-    }
-    Line::from(spans)
-}
-
-fn compact_account_label(account: &str) -> String {
-    if account == ACCOUNT_CODEX {
-        "Codex".to_string()
-    } else if is_claude_code_account(account) {
-        "Claude Code".to_string()
-    } else {
-        account.replace(" API key", "")
-    }
-}
-
-fn fit_cell(value: &str, width: usize) -> String {
-    format!("{:<width$}", truncate(value, width))
 }
 
 fn render_composer_input(
@@ -1769,12 +1501,7 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn ready_lines(
-    app: &App,
-    state: &WorkbenchState,
-    width: u16,
-    max_h: u16,
-) -> Vec<Line<'static>> {
+fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
@@ -1791,150 +1518,6 @@ fn ready_lines(
     ));
     let _ = state;
     lines
-}
-
-/// The Browser Use config card, emitted once at the top of every session
-/// transcript so the model/account/browser context stays visible per session.
-pub(crate) fn session_header_lines(
-    app: &App,
-    state: &WorkbenchState,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let mut lines = config_card_lines(app, state, width as usize);
-    lines.push(Line::from(""));
-    lines
-}
-
-fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
-    // Cap at 94 cols so the card has a comfortable max on wide terminals, but
-    // never enforce a min — when the terminal narrows below that cap the card
-    // shrinks with it instead of overflowing and forcing a wrap.
-    let card_w = width.min(94);
-    let inner_w = card_w.saturating_sub(2);
-    let rule = || Line::from(Span::styled(format!("+{}+", "-".repeat(inner_w)), border()));
-    let mut lines = vec![rule()];
-    lines.push(card_header_line("Browser Use Terminal", inner_w));
-    lines.push(card_blank_line(inner_w));
-    lines.push(card_kv_line("model", &app.model, "/model", inner_w));
-    lines.push(card_kv_line(
-        "account",
-        &compact_account_label(&app.account),
-        "/auth",
-        inner_w,
-    ));
-    lines.push(card_kv_line(
-        "browser",
-        &browser_ready_label(app, state).replace(" ready", " idle"),
-        "/browser",
-        inner_w,
-    ));
-    lines.push(card_kv_line("directory", &cwd_label(), "", inner_w));
-    lines.push(card_kv_line(
-        "telemetry",
-        &app.laminar_status()
-            .unwrap_or_else(|_| "Laminar unavailable".to_string()),
-        "/laminar",
-        inner_w,
-    ));
-    lines.push(rule());
-    lines
-}
-
-fn card_blank_line(inner_w: usize) -> Line<'static> {
-    card_text_line("", "", "", inner_w)
-}
-
-fn card_kv_line(label: &str, value: &str, action: &str, inner_w: usize) -> Line<'static> {
-    let label_w = 10usize.min(inner_w.saturating_sub(2));
-    let action_w = if action.is_empty() {
-        0
-    } else {
-        action.chars().count().saturating_add(2)
-    };
-    let value_w = inner_w
-        .saturating_sub(label_w)
-        .saturating_sub(action_w)
-        .saturating_sub(2)
-        .max(4);
-    let left = format!("{label:<label_w$}{}", truncate(value, value_w));
-    card_text_line(&left, action, "", inner_w)
-}
-
-/// The bolded title row at the top of the config card.
-fn card_header_line(title: &str, inner_w: usize) -> Line<'static> {
-    let title = truncate(title, inner_w.saturating_sub(1));
-    let title_len = title.chars().count();
-    let trailing = inner_w.saturating_sub(title_len + 1);
-    Line::from(vec![
-        Span::styled("|", border()),
-        Span::raw(" "),
-        Span::styled(title, bold()),
-        Span::raw(" ".repeat(trailing)),
-        Span::styled("|", border()),
-    ])
-}
-
-fn card_text_line(left: &str, right: &str, _extra: &str, inner_w: usize) -> Line<'static> {
-    let right_len = right.chars().count();
-    let left_w = inner_w.saturating_sub(right_len).saturating_sub(1);
-    let left = truncate(left, left_w);
-    let left_len = left.chars().count();
-    let spaces = inner_w.saturating_sub(left_len + right_len);
-    Line::from(vec![
-        Span::styled("|", border()),
-        Span::raw(" "),
-        Span::styled(left, text_style()),
-        Span::raw(" ".repeat(spaces.saturating_sub(1))),
-        Span::styled(right.to_string(), accent()),
-        Span::styled("|", border()),
-    ])
-}
-
-fn cwd_label() -> String {
-    let cwd = std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-    if let Some(home) = std::env::var_os("HOME").and_then(|home| home.into_string().ok()) {
-        if let Some(rest) = cwd.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
-    }
-    cwd
-}
-
-/// Status marker for a history row — conveys outcome at a glance, paired with
-/// the status color, instead of a bare colon.
-fn status_glyph(status: &str) -> char {
-    match status {
-        "done" => '✓',
-        "failed" => '✗',
-        "running" | "created" => '●',
-        "cancelled" => '○',
-        _ => '·',
-    }
-}
-
-fn history_plain_row(row: &HistoryRow, width: usize) -> Line<'static> {
-    let time = relative_time(row.updated_ms);
-    let status = row.status.as_str();
-    let status_label = match status {
-        "done" => "done",
-        "running" | "created" => "running",
-        "failed" => "failed",
-        "cancelled" => "stopped",
-        _ => status,
-    };
-    let prefix = format!("{} {status_label:<8}", status_glyph(status));
-    let prefix_len = prefix.chars().count() + 2;
-    let time_len = time.chars().count();
-    let task_w = width.saturating_sub(prefix_len + time_len + 2).max(12);
-    Line::from(vec![
-        Span::styled(prefix, status_style(row.status.as_str())),
-        Span::raw("  "),
-        Span::styled(fit_cell(&row.task, task_w), text_style()),
-        Span::raw("  "),
-        Span::styled(time, muted()),
-    ])
 }
 
 fn work_lines(
@@ -2276,17 +1859,6 @@ fn append_telemetry_detail_lines(lines: &mut Vec<Line<'static>>, telemetry: &Tel
             "status",
             &format!("disabled: {}", truncate(&first_line(error), 120)),
         ));
-    }
-}
-
-fn browser_ready_label(app: &App, state: &WorkbenchState) -> String {
-    if cloud_browser_needs_key(app) {
-        return format!("{} needs key", app.browser);
-    }
-    if state.browser.status == "not connected" {
-        format!("{} ready", app.browser)
-    } else {
-        format!("{} {}", app.browser, state.browser.status)
     }
 }
 

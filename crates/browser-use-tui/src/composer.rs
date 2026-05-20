@@ -697,8 +697,12 @@ mod tests {
         }
 
         composer.set_input("alpha  ".to_string());
-        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
         assert_eq!(composer.input(), "alpha");
+
+        composer.set_input("alpha  ".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
+        assert_eq!(composer.input(), "");
     }
 
     #[test]

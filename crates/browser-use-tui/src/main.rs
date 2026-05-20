@@ -14,9 +14,9 @@ use browser_use_store::{Store, StoreNotification};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
@@ -1891,7 +1891,6 @@ fn run_terminal(mut app: App) -> Result<()> {
         Clear(ClearType::All),
         MoveTo(0, 0),
         EnableBracketedPaste,
-        EnableMouseCapture,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -2039,6 +2038,7 @@ fn desired_terminal_viewport_height_for(
     if app.is_first_run_setup_visible()?
         || app.selected_session_id.is_none()
         || app.surface.is_bottom_pane()
+        || app.is_slash_palette_active()
     {
         return Ok(full_height);
     }
@@ -2069,24 +2069,6 @@ fn handle_terminal_event(
         TermEvent::Key(key) => app.handle_key(key),
         TermEvent::Paste(text) => {
             app.handle_paste(&text);
-            Ok(false)
-        }
-        TermEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(_),
-            column,
-            row,
-            ..
-        }) if app.is_welcome_surface() => {
-            // Only throw if the click lands inside the logo's bounding box.
-            if let Some(rect) = app.welcome_logo_rect.get() {
-                if column >= rect.x
-                    && column < rect.x.saturating_add(rect.width)
-                    && row >= rect.y
-                    && row < rect.y.saturating_add(rect.height)
-                {
-                    app.welcome_anim.throw();
-                }
-            }
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -2148,7 +2130,11 @@ fn maybe_emit_native_transcript(
 ) -> Result<()> {
     let size = terminal.size()?;
     let state = app.workbench_state()?;
-    if !app.surface.uses_main_view() || app.is_first_run_setup_visible()? {
+    if !app.surface.uses_main_view()
+        || app.is_first_run_setup_visible()?
+        || app.surface.is_popup()
+        || app.is_slash_palette_active()
+    {
         return Ok(());
     }
     let should_clear = app.native_history.take_clear_before_replay();
@@ -2435,7 +2421,6 @@ fn restore_terminal(mut target: impl io::Write) -> Result<()> {
         ResetKeyboardEnhancementFlags,
         DisableModifyOtherKeys,
         DisableBracketedPaste,
-        DisableMouseCapture,
     )?;
     Ok(())
 }
@@ -2856,18 +2841,16 @@ mod redesign_tests {
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
-        // New welcome screen: a centered logo + a small menu and a tip.
+        // New welcome screen: a centered logo + a small menu.
         assert!(ready_screen.contains("New worktree"));
         assert!(ready_screen.contains("Resume session"));
-        assert!(ready_screen.contains("Tip:"));
-        // Fused composer carries model + browser metadata in its top border.
+        // Fused composer carries model metadata in the status row.
         assert!(ready_screen.contains("GPT-5.5"));
-        assert!(ready_screen.contains("Local Chrome"));
         // Composer placeholder stays the same so users see the prompt-to-act.
         assert!(ready_screen.contains("Tell the browser what to do..."));
-        // Home screen keeps the command hints in the footer.
-        assert!(ready_screen.contains("Enter:send"));
-        assert!(ready_screen.contains("Tab:history"));
+        // Home screen keeps direct action hints in the welcome menu.
+        assert!(ready_screen.contains("ctrl-w"));
+        assert!(ready_screen.contains("ctrl-s"));
         assert!(!ready_screen.contains("[ new task ]"));
 
         app.selected_session_id = Some(session.id);
@@ -2936,9 +2919,9 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
-        let input_row = row_containing(&screen, "> /");
-        // The dropdown is now a popup whose input row shows `> /`, with
-        // command items rendered just below it.
+        let input_row = row_containing(&screen, "> ");
+        // The palette owns its own input row, with command items rendered just
+        // below it.
         assert!(screen
             .lines()
             .enumerate()
@@ -2959,12 +2942,88 @@ mod redesign_tests {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
         let screen = render_dump(&mut app)?;
-        let input_row = row_containing(&screen, "> /mo");
+        let input_row = row_containing(&screen, "> mo");
         assert!(screen
             .lines()
             .enumerate()
             .any(|(idx, line)| idx > input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_layers_over_running_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "tell me about this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the repository layout..."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/task"));
+        assert!(screen.contains("Reading the repository layout"));
+        assert!(screen.contains("Type to steer the agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_layers_over_completed_native_transcript() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 28;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "This is a Rust terminal UI with native scrollback."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/task"));
+        assert!(screen.contains("This is a Rust terminal UI with native scrollback."));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_popups_layer_over_running_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "tell me about this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the repository layout..."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.open_surface(Surface::Browser);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Current browser"));
         Ok(())
     }
 
@@ -3166,8 +3225,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         let slash_palette_count = app.slash_palette_items().len();
         assert_nav(&mut app, slash_palette_count)?;
-        app.composer.clear();
-        app.selected_row = 0;
+        app.close_slash_palette();
 
         let failed = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -3510,6 +3568,39 @@ mod redesign_tests {
         assert!(!screen.contains("Checking \n"));
         assert!(!screen.contains(": answer draft"));
         assert!(screen.contains("This is the answer draft."));
+        Ok(())
+    }
+
+    #[test]
+    fn live_thinking_uses_available_viewport_before_summarizing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "think through the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        let thinking = (1..=12)
+            .map(|idx| format!("thinking line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": thinking, "label": "reasoning"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("thinking line 1"));
+        assert!(screen.contains("thinking line 12"));
+        assert!(!screen.contains("... +"));
         Ok(())
     }
 
@@ -3916,6 +4007,49 @@ mod redesign_tests {
     }
 
     #[test]
+    fn active_child_progress_uses_available_viewport_before_summarizing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "tell me about this repo"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer", "role": "explorer"}),
+        )?;
+        for idx in 1..=12 {
+            app.store.append_event(
+                &child.id,
+                "file.read",
+                serde_json::json!({"path": format!("/repo/file-{idx}.rs")}),
+            )?;
+        }
+        app.store.append_event(
+            &child.id,
+            "model.turn.request",
+            serde_json::json!({"model": "gpt-5.5"}),
+        )?;
+        app.selected_session_id = Some(parent.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("read /repo/file-1.rs"));
+        assert!(screen.contains("read /repo/file-12.rs"));
+        assert!(screen.contains("waiting for gpt-5.5"));
+        Ok(())
+    }
+
+    #[test]
     fn transcript_hides_lifecycle_events_and_groups_semantic_activity() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -4239,7 +4373,59 @@ mod redesign_tests {
     }
 
     #[test]
-    fn slash_palette_does_not_resize_completed_history_viewport() -> Result<()> {
+    fn native_scrollback_running_live_view_stays_attached_to_committed_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 28;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "Find the top 5 Hacker News posts"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.page",
+            serde_json::json!({
+                "url": "https://news.ycombinator.com",
+                "title": "Hacker News",
+            }),
+        )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the page and preparing the next browser action..."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id, committed_seq);
+
+        let screen = render_dump(&mut app)?;
+        let live_row = row_containing(&screen, "Reading the page and preparing");
+        let composer_row = row_containing(&screen, "Type to steer the agent");
+        assert!(
+            live_row <= 2,
+            "live reasoning should render directly under native scrollback, not after a large gap\n{screen}"
+        );
+        assert!(
+            composer_row > live_row,
+            "composer should stay below live reasoning\n{screen}"
+        );
+        assert!(
+            composer_row.saturating_sub(live_row) <= 8,
+            "live reasoning and composer should not be separated by a large blank gap\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_expands_completed_history_viewport_for_modal() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4262,7 +4448,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         assert!(app.is_slash_palette_active());
         let after = desired_terminal_viewport_height(&mut app)?;
-        assert_eq!(before, after);
+        assert!(after > before);
         Ok(())
     }
 
