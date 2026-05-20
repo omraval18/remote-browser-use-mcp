@@ -868,6 +868,20 @@ fn render_composer(
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
 
+    // IMPORTANT: render the input FIRST. Ratatui's Paragraph::render fills the
+    // entire area with its base style (`Style::default().fg(text())` for the
+    // composer input), which would otherwise paint over the bottom-border row
+    // and bleach our dim border to bright white.
+    if inner.width > 2 && inner.height > 0 {
+        let input_area = Rect {
+            x: inner.x.saturating_add(1),
+            y: inner.y,
+            width: inner.width.saturating_sub(2),
+            height: inner.height.saturating_sub(1),
+        };
+        render_composer_input(frame, input_area, app, state.current_session.as_ref());
+    }
+
     let bottom_area = Rect {
         x: box_area.x,
         y: box_area.y + box_area.height.saturating_sub(1),
@@ -875,19 +889,9 @@ fn render_composer(
         height: 1,
     };
     frame.render_widget(
-        Paragraph::new(composer_bottom_border(box_area.width)),
+        Paragraph::new(composer_bottom_border(box_area.width)).style(border()),
         bottom_area,
     );
-
-    if inner.width > 2 && inner.height > 0 {
-        let input_area = Rect {
-            x: inner.x.saturating_add(1),
-            y: inner.y,
-            width: inner.width.saturating_sub(2),
-            height: inner.height,
-        };
-        render_composer_input(frame, input_area, app, state.current_session.as_ref());
-    }
 
     if status_h > 0 {
         let status_area = Rect {
