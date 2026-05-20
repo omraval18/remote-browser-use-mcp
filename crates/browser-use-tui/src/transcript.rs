@@ -5,12 +5,14 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::{highlight_code_line_spans, render_markdown_lines};
 use crate::theme::{
-    dim, failed, link, muted, running, text_style, thought, user_prompt_accent, user_prompt_text,
+    dim, failed, link, muted, path_reference, running, text_style, thought, user_prompt_accent,
+    user_prompt_text,
 };
 
 use super::App;
 
 const ACTIVE_LIVE_LINE_LIMIT: usize = 48;
+const ACTIVE_FALLBACK_STATUS: &str = "running browser task";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
@@ -25,6 +27,11 @@ pub(crate) struct TranscriptModel {
     pub(crate) active: Option<TranscriptNode>,
     pub(crate) last_event_seq: i64,
     pub(crate) revision: u64,
+}
+
+pub(crate) struct TerminalScrollbackEmission {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) last_seq: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +174,33 @@ impl TranscriptNode {
                     || (*style == NodeStyle::Thought && group.starts_with("thought"))
         )
     }
+
+    fn is_active_viewport_placeholder(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::ActiveStatus {
+                group,
+                lines,
+                style,
+            } => {
+                group == "status"
+                    && *style == NodeStyle::Muted
+                    && lines.len() == 1
+                    && lines[0] == ACTIVE_FALLBACK_STATUS
+            }
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .all(TranscriptNode::is_active_viewport_placeholder),
+            _ => false,
+        }
+    }
+
+    fn is_prompt(&self) -> bool {
+        matches!(self.kind, TranscriptKind::Prompt { .. })
+    }
+
+    fn is_followup_prompt(&self) -> bool {
+        matches!(self.kind, TranscriptKind::Prompt { followup: true, .. })
+    }
 }
 
 pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<TranscriptModel> {
@@ -215,20 +249,58 @@ pub(crate) fn all_terminal_scrollback_lines(
     )
 }
 
-pub(crate) fn terminal_scrollback_lines_since(
+pub(crate) fn terminal_scrollback_emission_since(
     model: &TranscriptModel,
     after_seq: i64,
     width: u16,
-) -> Vec<Line<'static>> {
-    cells_to_lines(
-        model
-            .committed
-            .iter()
-            .filter(|node| node.seq() > after_seq)
-            .filter(|node| !node.is_terminal_scrollback_transient()),
-        width,
-        DisplayMode::Scrollback,
-    )
+    defer_pending_prompt: bool,
+) -> TerminalScrollbackEmission {
+    let pending_prompt_seq = defer_pending_prompt
+        .then(|| pending_prompt_seq(model))
+        .flatten();
+    let nodes = model
+        .committed
+        .iter()
+        .filter(|node| node.seq() > after_seq)
+        .filter(|node| !node.is_terminal_scrollback_transient())
+        .filter(|node| Some(node.seq()) != pending_prompt_seq)
+        .collect::<Vec<_>>();
+    let last_seq = nodes.last().map(|node| node.seq()).unwrap_or(after_seq);
+    TerminalScrollbackEmission {
+        lines: cells_to_lines(nodes.iter().copied(), width, DisplayMode::Scrollback),
+        last_seq,
+    }
+}
+
+fn pending_prompt_seq(model: &TranscriptModel) -> Option<i64> {
+    let latest_prompt_idx = latest_followup_prompt_over_scrollback_idx(model)?;
+    let has_non_prompt_after = model
+        .committed
+        .iter()
+        .skip(latest_prompt_idx.saturating_add(1))
+        .filter(|node| !node.is_terminal_scrollback_transient())
+        .any(|node| !node.is_prompt());
+    (!has_non_prompt_after).then(|| model.committed[latest_prompt_idx].seq())
+}
+
+pub(crate) fn has_followup_over_scrollback(model: Option<&TranscriptModel>) -> bool {
+    model.is_some_and(|model| latest_followup_prompt_over_scrollback_idx(model).is_some())
+}
+
+fn latest_followup_prompt_over_scrollback_idx(model: &TranscriptModel) -> Option<usize> {
+    let latest_prompt_idx = model
+        .committed
+        .iter()
+        .rposition(TranscriptNode::is_prompt)?;
+    if !model.committed[latest_prompt_idx].is_followup_prompt() {
+        return None;
+    }
+    model
+        .committed
+        .iter()
+        .take(latest_prompt_idx)
+        .any(|node| !node.is_terminal_scrollback_transient())
+        .then_some(latest_prompt_idx)
 }
 
 pub(crate) fn active_viewport_lines(
@@ -239,12 +311,21 @@ pub(crate) fn active_viewport_lines(
     let Some(active) = model.and_then(|model| model.active.as_ref()) else {
         return Vec::new();
     };
+    if active.is_active_viewport_placeholder() {
+        return Vec::new();
+    }
     let mut lines = active.display_lines(width, DisplayMode::Active);
     if lines.len() > height as usize {
         let start = lines.len().saturating_sub(height as usize);
         lines = lines.into_iter().skip(start).collect();
     }
     lines
+}
+
+pub(crate) fn active_viewport_has_live_content(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(|active| !active.is_active_viewport_placeholder())
 }
 
 pub(crate) fn model_plain_text(model: &TranscriptModel) -> String {
@@ -772,11 +853,17 @@ fn active_node_for_session(
     root: &SessionMeta,
     events: &[EventRecord],
 ) -> Option<TranscriptNode> {
+    let live_events = current_turn_events(events);
+
+    if let Some(pending_followup) = pending_followup_active_node(app, state, root, events) {
+        return Some(pending_followup);
+    }
+
     if let Some(child) = active_child_session(app, &root.id) {
         let label = helper_label_for_session(app, &child.id);
         let group = format!("subagent {label}");
         let mut lines = vec!["working".to_string()];
-        if let Some(wait_event) = events
+        if let Some(wait_event) = live_events
             .iter()
             .rev()
             .find(|event| event.event_type == "agent.wait.started")
@@ -816,7 +903,7 @@ fn active_node_for_session(
     let mut active_nodes = Vec::new();
 
     let suppress_model_wait = live_streaming_text.is_some() && live_thinking_text.is_none();
-    if let Some(event) = events.iter().rev().find(|event| {
+    if let Some(event) = live_events.iter().rev().find(|event| {
         matches!(
             event.event_type.as_str(),
             "model.turn.request" | "model.turn.retry" | "agent.wait.started"
@@ -870,7 +957,7 @@ fn active_node_for_session(
         });
     }
 
-    if let Some(event) = events.iter().rev().find(|event| {
+    if let Some(event) = live_events.iter().rev().find(|event| {
         matches!(
             event.event_type.as_str(),
             "command.waiting" | "tool.started" | "browser.page" | "browser.state" | "plan.updated"
@@ -883,9 +970,62 @@ fn active_node_for_session(
         root,
         events,
         "status",
-        vec!["running browser task".to_string()],
+        vec![ACTIVE_FALLBACK_STATUS.to_string()],
         NodeStyle::Muted,
     ))
+}
+
+fn pending_followup_active_node(
+    app: &App,
+    state: &WorkbenchState,
+    root: &SessionMeta,
+    events: &[EventRecord],
+) -> Option<TranscriptNode> {
+    let latest_followup = events
+        .iter()
+        .rev()
+        .find(|event| event.session_id == root.id && event.event_type == "session.followup")?;
+    let has_prior_scrollback = events
+        .iter()
+        .filter(|event| event.seq < latest_followup.seq)
+        .filter_map(|event| committed_node_for_event(app, state, root, event))
+        .any(|node| !node.is_terminal_scrollback_transient());
+    if !has_prior_scrollback {
+        return None;
+    }
+    let has_committed_output_after = events
+        .iter()
+        .filter(|event| event.seq > latest_followup.seq)
+        .filter_map(|event| committed_node_for_event(app, state, root, event))
+        .filter(|node| !node.is_terminal_scrollback_transient())
+        .any(|node| !node.is_prompt());
+    if has_committed_output_after {
+        return None;
+    }
+    let text = payload_string(latest_followup, "text")?;
+    Some(TranscriptNode {
+        id: format!("{}:active-followup:{}", root.id, latest_followup.seq),
+        seq: latest_followup.seq,
+        revision: latest_followup.seq.max(0) as u64,
+        kind: TranscriptKind::Prompt {
+            text,
+            followup: true,
+        },
+    })
+}
+
+fn current_turn_events(events: &[EventRecord]) -> &[EventRecord] {
+    let start = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup"
+            )
+        })
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    events.get(start..).unwrap_or_default()
 }
 
 fn active_node_for_event(
@@ -1374,7 +1514,7 @@ fn push_maybe_path_token(spans: &mut Vec<Span<'static>>, token: &str, fallback: 
         if !prefix.is_empty() {
             spans.push(Span::styled(prefix.to_string(), fallback));
         }
-        spans.push(Span::styled(core.to_string(), link()));
+        spans.push(Span::styled(core.to_string(), reference_token_style(core)));
         if !suffix.is_empty() {
             spans.push(Span::styled(suffix.to_string(), fallback));
         }
@@ -1432,7 +1572,7 @@ fn looks_like_shell_line(text: &str) -> bool {
 }
 
 fn looks_like_path_token(token: &str) -> bool {
-    if token.starts_with("http://") || token.starts_with("https://") {
+    if looks_like_url_token(token) {
         return true;
     }
     let has_path_character = token
@@ -1442,6 +1582,18 @@ fn looks_like_path_token(token: &str) -> bool {
         || (has_path_character
             && (token.starts_with("~/") || token.starts_with("./") || token.starts_with("../")))
         || source_extension(token).is_some()
+}
+
+fn reference_token_style(token: &str) -> Style {
+    if looks_like_url_token(token) {
+        link()
+    } else {
+        path_reference()
+    }
+}
+
+fn looks_like_url_token(token: &str) -> bool {
+    token.starts_with("http://") || token.starts_with("https://")
 }
 
 fn source_extension(token: &str) -> Option<&str> {
@@ -2031,6 +2183,9 @@ mod tests {
         );
         assert!(path_spans
             .iter()
+            .any(|span| span.content.contains("markdown.rs") && span.style == path_reference()));
+        assert!(!path_spans
+            .iter()
             .any(|span| span.content.contains("markdown.rs") && span.style == link()));
     }
 
@@ -2054,6 +2209,9 @@ mod tests {
         assert!(!spans
             .iter()
             .any(|span| span.content.contains("./##") && span.style == link()));
+        assert!(!spans
+            .iter()
+            .any(|span| span.content.contains("./##") && span.style == path_reference()));
     }
 
     #[test]
@@ -2069,6 +2227,10 @@ mod tests {
         assert!(!spans
             .iter()
             .any(|span| span.content.contains("languages/frameworks") && span.style == link()));
+        assert!(!spans
+            .iter()
+            .any(|span| span.content.contains("languages/frameworks")
+                && span.style == path_reference()));
     }
 
     #[test]

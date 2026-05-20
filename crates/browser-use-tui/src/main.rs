@@ -64,6 +64,7 @@ const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
+const NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT: u16 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -2127,11 +2128,22 @@ fn desired_terminal_viewport_height_for(
         .current_session
         .as_ref()
         .is_some_and(|session| session.status.is_active());
-    let active_body_reserve = if selected_is_active {
-        full_height.saturating_sub(dock_height)
+    let transcript_model = transcript::transcript_model(app, &state);
+    let active_viewport_has_live_content =
+        transcript::active_viewport_has_live_content(transcript_model.as_ref());
+    let suppress_followup_resize =
+        transcript::has_followup_over_scrollback(transcript_model.as_ref());
+    let stable_followup_reserve = if app.native_scrollback_is_active() {
+        NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT
     } else {
         0
     };
+    let active_body_reserve =
+        if selected_is_active && active_viewport_has_live_content && !suppress_followup_resize {
+            full_height.saturating_sub(dock_height)
+        } else {
+            stable_followup_reserve
+        };
     Ok(dock_height
         .saturating_add(active_body_reserve)
         .min(full_height))
@@ -2366,14 +2378,18 @@ fn maybe_emit_native_transcript(
     };
     debug_assert_eq!(model.session_id, session_id);
     let _model_revision = model.revision;
+    let defer_pending_prompt = session.status.is_active();
 
     if !app.native_history.is_active_for(Some(&session_id)) {
         // No session header card — the transcript starts straight with
         // the conversation content.
-        let lines = transcript::all_terminal_scrollback_lines(&model, width);
-        insert_initial_native_lines(terminal, lines)?;
+        let emission =
+            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_pending_prompt);
+        if !emission.lines.is_empty() {
+            insert_initial_native_lines(terminal, emission.lines)?;
+        }
         app.native_history
-            .reset_for_session_with_group(session_id, model.last_event_seq, None);
+            .reset_for_session_with_group(session_id, emission.last_seq, None);
         return Ok(());
     }
 
@@ -2381,10 +2397,18 @@ fn maybe_emit_native_transcript(
     if model.last_event_seq <= after_seq {
         return Ok(());
     }
-    let lines = transcript::terminal_scrollback_lines_since(&model, after_seq, width);
-    app.native_history.last_seq = model.last_event_seq;
+    let emission = transcript::terminal_scrollback_emission_since(
+        &model,
+        after_seq,
+        width,
+        defer_pending_prompt,
+    );
+    if emission.lines.is_empty() {
+        return Ok(());
+    }
+    app.native_history.last_seq = emission.last_seq;
     app.native_history.last_group = None;
-    insert_native_lines(terminal, lines)?;
+    insert_native_lines(terminal, emission.lines)?;
     Ok(())
 }
 
@@ -4780,6 +4804,11 @@ mod redesign_tests {
         )?;
         app.store.append_event(
             &session.id,
+            "browser.state",
+            serde_json::json!({"url": "https://example.com", "title": "Example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
             "session.done",
             serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
         )?;
@@ -4793,6 +4822,63 @@ mod redesign_tests {
         assert!(app.is_slash_palette_active());
         let after = desired_terminal_viewport_height(&mut app)?;
         assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[test]
+    fn followup_over_native_scrollback_keeps_viewport_docked_through_live_activity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), last_seq);
+
+        let docked = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "yo".to_string(),
+        })?;
+        app.drain_store_notifications()?;
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        let prompt_only = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        assert_eq!(prompt_only, docked);
+        let prompt_only_screen = render_dump(&mut app)?;
+        assert!(prompt_only_screen.contains("> yo"));
+        assert!(prompt_only_screen.contains("Type to steer the agent"));
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        assert!(transcript::active_viewport_has_live_content(Some(&model)));
+        assert!(transcript::has_followup_over_scrollback(Some(&model)));
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.drain_store_notifications()?;
+        let waiting = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        assert_eq!(waiting, docked);
+        let waiting_screen = render_dump(&mut app)?;
+        assert!(waiting_screen.contains("> yo"));
         Ok(())
     }
 

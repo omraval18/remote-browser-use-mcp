@@ -1,5 +1,5 @@
 use anyhow::Result;
-use browser_use_protocol::{HistoryRow, SessionMeta, TelemetrySummary, WorkbenchState};
+use browser_use_protocol::{HistoryRow, TelemetrySummary, WorkbenchState};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
@@ -202,7 +202,8 @@ fn render_main(
     };
     let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active)
         && !layout_surface.is_bottom_pane();
-    let attach_bottom_to_body = native_scrollback_active && !layout_surface.is_bottom_pane();
+    let attach_bottom_to_body =
+        native_scrollback_active && !body.is_empty() && !layout_surface.is_bottom_pane();
     let (body_area, bottom_area, footer_area) = main_layout_areas(
         area,
         bottom_h,
@@ -1000,7 +1001,7 @@ fn render_composer(
             width: inner.width.saturating_sub(2),
             height: inner.height.saturating_sub(1),
         };
-        render_composer_input(frame, input_area, app, state.current_session.as_ref());
+        render_composer_input(frame, input_area, app, state);
     }
 
     let bottom_area = Rect {
@@ -1134,6 +1135,7 @@ fn context_bar_spans(used_tokens: i64) -> Vec<Span<'static>> {
     let fill_style = if ratio >= 0.9 { failed() } else { accent() };
 
     let filled = ((ratio * CONTEXT_BAR_WIDTH as f64).round() as usize).min(CONTEXT_BAR_WIDTH);
+    let pct_left = ((1.0 - ratio) * 100.0).round() as i64;
     vec![
         Span::styled("█".repeat(filled), fill_style),
         Span::styled("░".repeat(CONTEXT_BAR_WIDTH - filled), dim()),
@@ -1146,6 +1148,8 @@ fn context_bar_spans(used_tokens: i64) -> Vec<Span<'static>> {
             ),
             muted(),
         ),
+        Span::raw("  "),
+        Span::styled(format!("{pct_left}% context left"), muted()),
     ]
 }
 
@@ -1241,12 +1245,8 @@ fn format_token_count(tokens: i64) -> String {
     }
 }
 
-fn render_composer_input(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    current_session: Option<&SessionMeta>,
-) {
+fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
+    let current_session = state.current_session.as_ref();
     let placeholder = if current_session.is_some_and(|session| session.status.is_active()) {
         "Type to steer the agent..."
     } else if current_session.is_some() {

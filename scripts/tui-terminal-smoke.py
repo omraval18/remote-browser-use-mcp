@@ -9,13 +9,16 @@ duplicated panels in scrollback, broken bracketed paste, and stale redraws.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 
@@ -211,6 +214,24 @@ def assert_no_ansi(text: str, context: str) -> None:
         raise AssertionError(f"{context}: output contained ANSI escapes\n\n{text!r}")
 
 
+def latest_session_id(state_dir: Path) -> str:
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        row = conn.execute("SELECT id FROM sessions ORDER BY updated_ms DESC LIMIT 1").fetchone()
+    if row is None:
+        raise AssertionError(f"missing session in {state_dir}/state.db")
+    return str(row[0])
+
+
+def append_store_event(state_dir: Path, session_id: str, event_type: str, payload: dict[str, object]) -> None:
+    now_ms = int(time.time() * 1000)
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        conn.execute(
+            "INSERT INTO events(id, session_id, ts_ms, type, payload_json) VALUES (?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, session_id, now_ms, event_type, json.dumps(payload)),
+        )
+        conn.execute("UPDATE sessions SET updated_ms = ? WHERE id = ?", (now_ms, session_id))
+
+
 def assert_no_legacy_dashboard_chrome(text: str, context: str) -> None:
     assert_not_contains(text, "[box] Active objective", context)
     assert_not_contains(text, "[box] Task complete", context)
@@ -401,8 +422,9 @@ def smoke_ready_resize_does_not_leave_stale_frames(binary: Path) -> None:
         full = capture_after_idle(session, "ready-resize-scrollback")
         for name, text in [("visible", visible), ("scrollback", full)]:
             assert_contains(text, "Tell the browser what to do...", f"ready resize {name} should keep composer visible")
-            assert_count(text, "Browser Use Terminal ·", 1, f"ready resize {name} should keep one header")
-            assert_count(text, "New worktree", 1, f"ready resize {name} should keep one welcome menu")
+            assert_count(text, "Browser Use", 1, f"ready resize {name} should keep one header")
+            assert_count(text, "v0.1.0", 1, f"ready resize {name} should keep one version")
+            assert_count(text, "press / for shortcuts", 1, f"ready resize {name} should keep one shortcut hint")
             assert_not_contains(text, "^[[", f"ready resize {name} should not leak escape sequences")
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -550,14 +572,109 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
 
         tmux_send_literal(session, "continue")
         tmux_send(session, "Enter")
-        running = wait_for(session, "Type to steer the agent", "long-history-followup-running")
+        running = wait_for(session, "> continue", "long-history-followup-running")
         visible_running = capture_after_idle(session, "long-history-followup-visible", visible_only=True)
-        if visible_running.count("Type to steer the agent") > 1:
-            raise AssertionError(
-                "follow-up should not append duplicate app screens\n\n" + visible_running
-            )
+        assert_contains(
+            visible_running,
+            "scroll check line 60",
+            "prompt-only long follow-up should keep the previous transcript tail visible",
+        )
+        assert_contains(
+            visible_running,
+            "https://news.ycombinator.com",
+            "prompt-only long follow-up should keep the completed source visible",
+        )
+        assert_contains(
+            visible_running,
+            "> continue",
+            "prompt-only long follow-up should show the submitted prompt immediately",
+        )
+        first_line = next((line.strip() for line in visible_running.splitlines() if line.strip()), "")
+        if first_line == "> continue":
+            raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible_running)
         assert_no_legacy_dashboard_chrome(visible_running, "follow-up should not show old dashboard chrome")
         assert_not_contains(running, "using browser", "internal browser helper starts should stay hidden")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
+    session = f"but-smoke-prompt-only-followup-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-prompt-only-followup-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="done",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "prompt-only-followup-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        wait_for(session, "Top 5 Hacker News posts", "prompt-only-followup-selected")
+        tmux_send_literal(session, "yo")
+        tmux_send(session, "Enter")
+        wait_for(session, "> yo", "prompt-only-followup-running")
+        visible = capture_after_idle(
+            session,
+            "prompt-only-followup-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            visible,
+            "Top 5 Hacker News posts",
+            "prompt-only follow-up should keep the completed answer visible",
+        )
+        assert_contains(
+            visible,
+            "https://news.ycombinator.com",
+            "prompt-only follow-up should keep the completed source visible",
+        )
+        assert_contains(
+            visible,
+            "> yo",
+            "prompt-only follow-up should show the submitted prompt immediately",
+        )
+        first_line = next((line.strip() for line in visible.splitlines() if line.strip()), "")
+        if first_line == "> yo":
+            raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible)
+
+        session_id = latest_session_id(state_dir)
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.turn.request",
+            {"model": "GPT-5.5", "provider": "codex"},
+        )
+        live_frames = []
+        for idx in range(40):
+            live_visible = capture_after_idle(
+                session,
+                f"prompt-only-followup-live-{idx:02d}",
+                delay=0.03,
+                visible_only=True,
+            )
+            live_frames.append(live_visible)
+        for live_visible in live_frames:
+            assert_contains(
+                live_visible,
+                "Top 5 Hacker News posts",
+                "follow-up live activity should not resize away from the completed transcript",
+            )
+            assert_contains(
+                live_visible,
+                "https://news.ycombinator.com",
+                "follow-up live activity should keep the completed source visible",
+            )
+            assert_contains(
+                live_visible,
+                "> yo",
+                "follow-up live activity should keep the submitted prompt visible",
+            )
+            first_line = next((line.strip() for line in live_visible.splitlines() if line.strip()), "")
+            if first_line == "> yo":
+                raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + live_visible)
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -855,6 +972,7 @@ def main() -> int:
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
     smoke_double_escape_stops_running_task(binary)
     smoke_completed_history_uses_native_scrollback(binary)
+    smoke_prompt_only_followup_keeps_completed_transcript(binary)
     smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)
     smoke_session_switch_clears_previous_transcript(binary)
