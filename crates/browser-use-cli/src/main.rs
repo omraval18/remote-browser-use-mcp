@@ -433,7 +433,6 @@ struct DatasetProviderConfig {
 struct DatasetTaskPaths {
     root: PathBuf,
     cwd: PathBuf,
-    outputs: PathBuf,
     artifacts: PathBuf,
     agent_workspace: PathBuf,
     logs: PathBuf,
@@ -2002,7 +2001,6 @@ fn create_dataset_session(
             "attempt": attempt,
             "workspace": paths.cwd.display().to_string(),
             "task_root": paths.root.display().to_string(),
-            "outputs": paths.outputs.display().to_string(),
             "agent_workspace": paths.agent_workspace.display().to_string(),
             "runtime": paths.runtime.display().to_string(),
         }),
@@ -2598,7 +2596,6 @@ fn dataset_task_paths(
         ));
     DatasetTaskPaths {
         cwd: root.join("cwd"),
-        outputs: root.join("outputs"),
         artifacts: root.join("artifacts"),
         agent_workspace: root.join("agent-workspace"),
         logs: root.join("logs"),
@@ -2612,7 +2609,6 @@ fn create_dataset_task_dirs(paths: &DatasetTaskPaths) -> Result<()> {
     for path in [
         &paths.root,
         &paths.cwd,
-        &paths.outputs,
         &paths.artifacts,
         &paths.agent_workspace,
         &paths.logs,
@@ -2651,14 +2647,6 @@ fn dataset_python_env(
         (
             "BH_AGENT_WORKSPACE".to_string(),
             paths.agent_workspace.display().to_string(),
-        ),
-        (
-            "LLM_BROWSER_VIRTUAL_HOME".to_string(),
-            paths.root.display().to_string(),
-        ),
-        (
-            "LLM_BROWSER_OUTPUTS_DIR".to_string(),
-            paths.outputs.display().to_string(),
         ),
         (
             "LLM_BROWSER_BROWSER_MODE".to_string(),
@@ -2913,8 +2901,6 @@ fn pending_artifact_attempts(store: &Store, run_id: &str, task_id: &str) -> Resu
 }
 
 fn dataset_artifacts_for_paths(cwd: &Path, artifact_root: &Path) -> Result<Value> {
-    let task_root = cwd.parent().unwrap_or(cwd);
-    let outputs = task_root.join("outputs");
     let final_answer = artifact_root.join(".final_answer.json");
 
     let final_answer_summary = if final_answer.exists() {
@@ -2922,7 +2908,7 @@ fn dataset_artifacts_for_paths(cwd: &Path, artifact_root: &Path) -> Result<Value
     } else {
         Value::Null
     };
-    let output_summaries = summarize_output_dir(&outputs)?;
+    let output_summaries = summarize_output_dir(cwd)?;
     let found = !final_answer_summary.is_null() || !output_summaries.is_empty();
 
     Ok(serde_json::json!({

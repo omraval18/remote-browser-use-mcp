@@ -2719,18 +2719,26 @@ BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
 ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-VIRTUAL_HOME = pathlib.Path(os.environ.get("LLM_BROWSER_VIRTUAL_HOME") or str(ARTIFACT_DIR)).expanduser().resolve()
-OUTPUTS_DIR = pathlib.Path(os.environ.get("LLM_BROWSER_OUTPUTS_DIR") or str(ARTIFACT_DIR)).expanduser().resolve()
+OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _collectable_files(root):
+    if root.resolve() == OUTPUTS_DIR.resolve():
+        for path in root.iterdir():
+            if path.is_file():
+                yield path
+        return
+    for path in root.rglob("*"):
+        if path.is_file():
+            yield path
 
 def _scan_artifact_files():
     files = set()
     for root in (ARTIFACT_DIR, OUTPUTS_DIR):
         if not root.exists():
             continue
-        for path in root.rglob("*"):
-            if path.is_file():
-                files.add(str(path.resolve()))
+        for path in _collectable_files(root):
+            files.add(str(path.resolve()))
     return files
 
 __initial_artifact_files = _scan_artifact_files()
@@ -2790,9 +2798,7 @@ def _auto_collect_artifacts():
     for root in (ARTIFACT_DIR, OUTPUTS_DIR):
         if not root.exists():
             continue
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
+        for path in sorted(_collectable_files(root)):
             resolved = str(path.resolve())
             if resolved in __initial_artifact_files:
                 continue
@@ -2830,16 +2836,11 @@ def outputs_dir():
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     return str(OUTPUTS_DIR)
 
-def virtual_home():
-    return str(VIRTUAL_HOME)
-
 def session_metadata():
     return {{
         "cwd": str(CWD),
         "artifact_root": str(ARTIFACT_DIR),
         "outputs_dir": str(OUTPUTS_DIR),
-        "virtual_home": str(VIRTUAL_HOME),
-        "virtual_home_alias": "/home/user",
         "agent_workspace": str(pathlib.Path(agent_workspace())),
     }}
 
@@ -2856,7 +2857,6 @@ def load_agent_helpers():
 
 def _run_user_code():
     code = base64.b64decode({encoded_code:?}).decode()
-    code = code.replace("/home/user/outputs", outputs_dir()).replace("/home/user", virtual_home())
     exec(compile(code, "<browser_script>", "exec"), globals())
 
 stdout = io.StringIO()
@@ -3153,11 +3153,9 @@ mod tests {
             temp.path().join("artifacts"),
             r#"
 print('hello')
-manual = pathlib.Path('/home/user/outputs/manual.json')
-manual.parent.mkdir(parents=True, exist_ok=True)
-manual.write_text('{"manual": true}', encoding='utf-8')
 answer = pathlib.Path(outputs_dir()) / 'answer.json'
 answer.write_text(json.dumps({'ok': True}), encoding='utf-8')
+print(session_metadata()["outputs_dir"])
 "#,
             10,
         )
@@ -3168,10 +3166,7 @@ answer.write_text(json.dumps({'ok': True}), encoding='utf-8')
             .artifacts
             .iter()
             .any(|artifact| artifact["path"].as_str().unwrap().ends_with("answer.json")));
-        assert!(output
-            .artifacts
-            .iter()
-            .any(|artifact| artifact["path"].as_str().unwrap().ends_with("manual.json")));
+        assert!(output.text.contains(temp.path().to_str().unwrap()));
         for artifact in &output.artifacts {
             assert!(
                 Path::new(artifact["path"].as_str().unwrap()).is_absolute(),

@@ -52,7 +52,6 @@ copy_artifact(path, kind="file")
 emit_image(path, label=None)
 artifact_root()
 outputs_dir()
-virtual_home()
 session_metadata()
 audit_artifact(data=None, **requirements)
 load_agent_helpers()
@@ -67,8 +66,7 @@ Usage guidance:
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again.
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
-- Save complete generated files under `outputs_dir()` or `artifact_root()`. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
+- Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file and finish with `done(result_file=path)`.
-- `/home/user/outputs` is accepted as a compatibility alias for the current session output/artifact directory, but prefer `outputs_dir()` in new code.
 
 Do not call runtime-management helpers here. There is no `browser_connect`, `browser_status`, `browser_doctor`, or `browser_recover` helper in this tool. Those are intentionally only in the `browser` tool so the model can reason about browser lifecycle explicitly.

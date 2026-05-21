@@ -361,7 +361,7 @@ fn done_tool_spec() -> ToolSpec {
                 },
                 "result_file": {
                     "type": "string",
-                    "description": "Path to a text/JSON/CSV result file to use as the final answer. Prefer this for large browser_script outputs saved under outputs_dir() or artifact_root()."
+                    "description": "Path to a text/JSON/CSV result file to use as the final answer. Relative paths resolve against the current working directory; prefer this for large browser_script outputs saved under outputs_dir()."
                 },
                 "finish_and_close_children": {
                     "type": "boolean",

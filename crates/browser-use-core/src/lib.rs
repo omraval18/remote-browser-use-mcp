@@ -3437,11 +3437,7 @@ fn resolve_done_result_file(
     if path.is_absolute() {
         return vec![path.to_path_buf()];
     }
-    vec![
-        Path::new(&session.cwd).join(path),
-        Path::new(&session.artifact_root).join(path),
-        path.to_path_buf(),
-    ]
+    vec![Path::new(&session.cwd).join(path)]
 }
 
 fn guard_or_close_active_descendants(
@@ -6237,12 +6233,12 @@ mod tests {
     }
 
     #[test]
-    fn done_can_use_result_file_from_artifact_root() -> Result<()> {
+    fn done_can_use_result_file_from_cwd() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         std::fs::write(
-            Path::new(&session.artifact_root).join("answer.json"),
+            Path::new(&session.cwd).join("answer.json"),
             r#"{"items":[{"id":1},{"id":2}]}"#,
         )?;
 

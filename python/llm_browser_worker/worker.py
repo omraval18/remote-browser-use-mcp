@@ -243,30 +243,8 @@ def _agent_workspace_path(cwd: Path) -> Path:
     return (cwd / ".browser-use" / "agent-workspace").expanduser()
 
 
-def _virtual_home_path(cwd: Path) -> Path | None:
-    if cwd.name == "cwd" and (cwd.parent / "outputs").exists():
-        return cwd.parent
-    raw = os.environ.get("LLM_BROWSER_VIRTUAL_HOME")
-    if raw:
-        return Path(raw).expanduser()
-    return None
-
-
 def _outputs_dir_path(cwd: Path) -> Path:
-    raw = os.environ.get("LLM_BROWSER_OUTPUTS_DIR")
-    if raw:
-        return Path(raw).expanduser()
-    home = _virtual_home_path(cwd)
-    if home is not None:
-        return home / "outputs"
-    return cwd / "outputs"
-
-
-def _rewrite_virtual_home_text(text: str) -> str:
-    raw = os.environ.get("LLM_BROWSER_VIRTUAL_HOME")
-    if not raw:
-        return text
-    return text.replace("/home/user", raw)
+    return cwd
 
 
 def _pick_chromium_path() -> str:
@@ -1396,20 +1374,13 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         path.mkdir(parents=True, exist_ok=True)
         return str(path)
 
-    def virtual_home() -> str | None:
-        home = _virtual_home_path(Path(str(ns.get("cwd") or ".")))
-        return str(home) if home is not None else None
-
     def session_metadata() -> Dict[str, Any]:
         cwd_path = Path(str(ns.get("cwd") or "."))
-        home = _virtual_home_path(cwd_path)
         return {
             "session_id": str(ns.get("session_id")),
             "cwd": str(ns.get("cwd")),
             "artifact_root": str(artifact_dir),
             "outputs_dir": str(_outputs_dir_path(cwd_path)),
-            "virtual_home": str(home) if home is not None else None,
-            "virtual_home_alias": "/home/user" if home is not None else None,
             "agent_workspace": str(_agent_workspace_path(cwd_path)),
         }
 
@@ -1443,7 +1414,6 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "check_cancel": check_cancel,
             "artifact_root": artifact_root,
             "outputs_dir": outputs_dir,
-            "virtual_home": virtual_home,
             "session_metadata": session_metadata,
             "agent_workspace": agent_workspace,
             "load_agent_helpers": load_agent_helpers,
@@ -1659,7 +1629,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
     session_id = str(request.get("session_id") or "default")
     cwd = Path(str(request.get("cwd") or ".")).expanduser().resolve()
     artifact_dir = Path(str(request.get("artifact_dir") or cwd / "artifacts")).expanduser().resolve()
-    code = _rewrite_virtual_home_text(str(request.get("code") or ""))
+    code = str(request.get("code") or "")
     cancel_requested = bool(request.get("cancel_requested"))
     timeout_seconds = float(request.get("timeout_seconds") or 0)
     stdout = io.StringIO()
