@@ -3977,7 +3977,10 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("CHOOSE PROVIDER"));
+        assert!(screen.contains("Welcome to Browser Use Terminal"));
+        assert!(screen.contains("Choose a provider below."));
+        assert!(screen.contains("PROVIDERS"));
+        assert!(!screen.contains("CHOOSE PROVIDER"));
         assert!(screen.contains("Codex login"));
         assert!(screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
@@ -3994,7 +3997,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))?);
         assert!(app.composer.is_empty());
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("CHOOSE PROVIDER"));
+        assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("Tell the browser what to do"));
         app.store
             .set_setting("auth.codex.access_token", "codex-test-token")?;
@@ -4067,7 +4070,7 @@ mod redesign_tests {
         assert!(app.is_first_run_setup_visible()?);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("CHOOSE PROVIDER"));
+        assert!(screen.contains("PROVIDERS"));
         assert!(screen.contains("Codex login"));
         assert!(!screen.contains("Tell the browser what to do"));
         Ok(())

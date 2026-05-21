@@ -1319,6 +1319,8 @@ const SETUP_LOGO_GAP: usize = 8;
 const SETUP_RIGHT_W: usize = 58;
 const SETUP_CLICK_LABEL: &str = "click me!";
 const SETUP_CLICK_PREFIX_W: usize = 11;
+const SETUP_INTRO_MAX_W: usize = 74;
+const SETUP_INTRO: &str = "Welcome to Browser Use Terminal, a Rust-based command line for running browser agents. Choose a provider below.";
 
 fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -1412,14 +1414,43 @@ fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(centered_line("Browser Use", width, bold()));
         lines.push(centered_line("Terminal", width, muted()));
         lines.push(Line::from(""));
+        lines.extend(setup_intro_lines(width));
+        lines.push(Line::from(""));
         lines.extend(right_lines);
     }
 
     lines
 }
 
-fn setup_logo_is_side_by_side(width: usize) -> bool {
-    width >= setup_side_by_side_width().saturating_add(SETUP_CLICK_PREFIX_W.saturating_mul(2))
+fn setup_intro_lines(width: usize) -> Vec<Line<'static>> {
+    let wrap_width = width.min(SETUP_INTRO_MAX_W).max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+
+    for word in SETUP_INTRO.split_whitespace() {
+        let next_len = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if !current.is_empty() && next_len > wrap_width {
+            rows.push(centered_line(&current, width, muted()));
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        rows.push(centered_line(&current, width, muted()));
+    }
+
+    rows
+}
+
+fn setup_logo_is_side_by_side(_width: usize) -> bool {
+    false
 }
 
 fn setup_side_by_side_width() -> usize {
@@ -1450,7 +1481,7 @@ fn setup_logo_screen_rect(body_rect: Rect) -> Rect {
 
 fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled("CHOOSE PROVIDER", muted())));
+    lines.push(Line::from(Span::styled("PROVIDERS", muted())));
     lines.push(Line::from(""));
 
     for (idx, label) in ACCOUNT_CHOICES.iter().enumerate() {
