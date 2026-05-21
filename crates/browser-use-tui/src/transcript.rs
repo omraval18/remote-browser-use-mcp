@@ -6,8 +6,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::render_markdown_lines;
 use crate::theme::{
-    accent, dim, failed, link, muted, path_reference, running, text_style, thought,
-    user_prompt_accent, user_prompt_muted, user_prompt_text,
+    activity_group, activity_list, activity_read, activity_run, activity_search, activity_task,
+    dim, failed, link, muted, path_reference, text_style, thought, user_prompt_accent,
+    user_prompt_muted, user_prompt_text,
 };
 
 use super::App;
@@ -1599,9 +1600,12 @@ fn split_activity_line(text: &str) -> Option<(&str, &str, &str)> {
 
 fn activity_action_style(action: &str) -> Style {
     match action {
-        "run" | "read" | "list" | "search" | "artifact" | "command" => running(),
+        "read" => activity_read(),
+        "run" | "command" => activity_run(),
+        "list" => activity_list(),
+        "search" => activity_search(),
+        "artifact" | "task" | "follow-up" => activity_task(),
         "working" | "waiting" => thought(),
-        "task" | "follow-up" => accent(),
         _ => group_style(NodeStyle::Normal),
     }
 }
@@ -1760,7 +1764,7 @@ fn source_extension(token: &str) -> Option<&str> {
 
 fn group_style(style: NodeStyle) -> Style {
     match style {
-        NodeStyle::Normal => crate::theme::done(),
+        NodeStyle::Normal => activity_group(),
         NodeStyle::Muted => muted(),
         NodeStyle::Failed => failed(),
         NodeStyle::Thought => thought(),
@@ -2336,7 +2340,7 @@ mod tests {
         );
         assert!(spans
             .iter()
-            .any(|span| span.content.as_ref() == "run" && span.style == running()));
+            .any(|span| span.content.as_ref() == "run" && span.style == activity_run()));
         assert!(spans
             .iter()
             .any(|span| span.content.as_ref() == "find" && span.style == text_style()));
@@ -2357,7 +2361,7 @@ mod tests {
         );
         assert!(spans
             .iter()
-            .any(|span| span.content.as_ref() == "task" && span.style == accent()));
+            .any(|span| span.content.as_ref() == "task" && span.style == activity_task()));
         assert!(!spans
             .iter()
             .any(|span| span.content.contains("languages/frameworks") && span.style == link()));
@@ -2371,8 +2375,8 @@ mod tests {
     fn child_activity_state_words_are_highlighted() {
         for (line, expected_style) in [
             ("working", thought()),
-            ("list .", running()),
-            ("read Taskfile.yml", running()),
+            ("list .", activity_list()),
+            ("read Taskfile.yml", activity_read()),
         ] {
             let spans = styled_value_spans("subagent repo explorer", line, text_style());
             let action = line.split_whitespace().next().unwrap_or(line);
@@ -2383,5 +2387,29 @@ mod tests {
                 "{line:?} did not highlight {action:?}"
             );
         }
+    }
+
+    #[test]
+    fn activity_roles_use_distinct_styles() {
+        let group_style = group_style(NodeStyle::Normal);
+        for style in [
+            activity_read(),
+            activity_run(),
+            activity_list(),
+            activity_search(),
+            activity_task(),
+        ] {
+            assert_ne!(group_style, style);
+        }
+        assert_ne!(activity_read(), activity_run());
+        assert_ne!(activity_read(), activity_list());
+        assert_ne!(activity_read(), activity_search());
+        assert_ne!(activity_read(), activity_task());
+        assert_ne!(activity_run(), activity_list());
+        assert_ne!(activity_run(), activity_search());
+        assert_ne!(activity_run(), activity_task());
+        assert_ne!(activity_list(), activity_search());
+        assert_ne!(activity_list(), activity_task());
+        assert_ne!(activity_search(), activity_task());
     }
 }
