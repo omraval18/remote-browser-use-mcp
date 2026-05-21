@@ -4,10 +4,10 @@ use ratatui::text::{Line, Span};
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::{highlight_code_line_spans, render_markdown_lines};
+use crate::markdown::render_markdown_lines;
 use crate::theme::{
-    dim, failed, link, muted, path_reference, running, text_style, thought, user_prompt_accent,
-    user_prompt_muted, user_prompt_text,
+    accent, dim, failed, link, muted, path_reference, running, text_style, thought,
+    user_prompt_accent, user_prompt_muted, user_prompt_text,
 };
 
 use super::App;
@@ -52,8 +52,7 @@ enum TranscriptKind {
         text: String,
         followup: bool,
     },
-    PendingPrompt {
-        text: String,
+    PendingStatus {
         status: String,
     },
     Assistant {
@@ -107,9 +106,7 @@ impl TranscriptNode {
         match &self.kind {
             TranscriptKind::Stack { nodes } => cells_to_lines(nodes.iter(), width, mode),
             TranscriptKind::Prompt { text, followup } => prompt_lines(text, *followup, width),
-            TranscriptKind::PendingPrompt { text, status } => {
-                prompt_lines_with_status(text, true, width, Some(status))
-            }
+            TranscriptKind::PendingStatus { status } => pending_status_lines(status),
             TranscriptKind::Assistant { markdown, source } => {
                 let mut lines = markdown_cell_lines(markdown, width, mode);
                 if let Some(source) = source.as_deref() {
@@ -150,9 +147,8 @@ impl TranscriptNode {
             TranscriptKind::Stack { nodes } => {
                 nodes.iter().flat_map(|node| node.plain_lines()).collect()
             }
-            TranscriptKind::Prompt { text, .. } | TranscriptKind::PendingPrompt { text, .. } => {
-                prefixed_plain("> ", text)
-            }
+            TranscriptKind::Prompt { text, .. } => prefixed_plain("> ", text),
+            TranscriptKind::PendingStatus { status } => vec![status.clone()],
             TranscriptKind::Assistant { markdown, source } => {
                 let mut out = markdown.lines().map(str::to_string).collect::<Vec<_>>();
                 if let Some(source) = source.as_ref() {
@@ -205,15 +201,49 @@ impl TranscriptNode {
     }
 
     fn is_pending_followup_indicator(&self) -> bool {
-        matches!(self.kind, TranscriptKind::PendingPrompt { .. })
+        matches!(self.kind, TranscriptKind::PendingStatus { .. })
     }
 
     fn is_prompt(&self) -> bool {
         matches!(self.kind, TranscriptKind::Prompt { .. })
     }
 
-    fn is_followup_prompt(&self) -> bool {
-        matches!(self.kind, TranscriptKind::Prompt { followup: true, .. })
+    fn display_lines_with_stream_skip(
+        &self,
+        width: u16,
+        mode: DisplayMode,
+        stream_skip_lines: &mut usize,
+    ) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => {
+                cells_to_lines_with_stream_skip(nodes.iter(), width, mode, stream_skip_lines)
+            }
+            TranscriptKind::StreamingAssistant { markdown } => {
+                let mut lines = markdown_cell_lines(markdown, width, mode);
+                let skip = (*stream_skip_lines).min(lines.len().saturating_sub(1));
+                *stream_skip_lines = (*stream_skip_lines).saturating_sub(skip);
+                if skip > 0 {
+                    lines = lines.into_iter().skip(skip).collect();
+                }
+                lines
+            }
+            _ => self.display_lines(width, mode),
+        }
+    }
+
+    fn streaming_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .flat_map(|node| node.streaming_display_lines(width))
+                .collect(),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                markdown_cell_lines(markdown, width, DisplayMode::Active)
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -267,61 +297,19 @@ pub(crate) fn terminal_scrollback_emission_since(
     model: &TranscriptModel,
     after_seq: i64,
     width: u16,
-    defer_pending_prompt: bool,
+    _defer_pending_prompt: bool,
 ) -> TerminalScrollbackEmission {
-    let pending_prompt_seq = defer_pending_prompt
-        .then(|| pending_prompt_seq(model))
-        .flatten();
     let nodes = model
         .committed
         .iter()
         .filter(|node| node.seq() > after_seq)
         .filter(|node| !node.is_terminal_scrollback_transient())
-        .filter(|node| Some(node.seq()) != pending_prompt_seq)
         .collect::<Vec<_>>();
     let last_seq = nodes.last().map(|node| node.seq()).unwrap_or(after_seq);
     TerminalScrollbackEmission {
         lines: cells_to_lines(nodes.iter().copied(), width, DisplayMode::Scrollback),
         last_seq,
     }
-}
-
-fn pending_prompt_seq(model: &TranscriptModel) -> Option<i64> {
-    if !model
-        .active
-        .as_ref()
-        .is_some_and(TranscriptNode::is_pending_followup_indicator)
-    {
-        return None;
-    }
-    let latest_prompt_idx = latest_followup_prompt_over_scrollback_idx(model)?;
-    let has_non_prompt_after = model
-        .committed
-        .iter()
-        .skip(latest_prompt_idx.saturating_add(1))
-        .filter(|node| !node.is_terminal_scrollback_transient())
-        .any(|node| !node.is_prompt());
-    (!has_non_prompt_after).then(|| model.committed[latest_prompt_idx].seq())
-}
-
-pub(crate) fn has_followup_over_scrollback(model: Option<&TranscriptModel>) -> bool {
-    model.is_some_and(|model| latest_followup_prompt_over_scrollback_idx(model).is_some())
-}
-
-fn latest_followup_prompt_over_scrollback_idx(model: &TranscriptModel) -> Option<usize> {
-    let latest_prompt_idx = model
-        .committed
-        .iter()
-        .rposition(TranscriptNode::is_prompt)?;
-    if !model.committed[latest_prompt_idx].is_followup_prompt() {
-        return None;
-    }
-    model
-        .committed
-        .iter()
-        .take(latest_prompt_idx)
-        .any(|node| !node.is_terminal_scrollback_transient())
-        .then_some(latest_prompt_idx)
 }
 
 pub(crate) fn active_viewport_lines(
@@ -343,6 +331,38 @@ pub(crate) fn active_viewport_lines(
     lines
 }
 
+pub(crate) fn active_viewport_lines_with_stream_skip(
+    model: Option<&TranscriptModel>,
+    width: u16,
+    height: u16,
+    stream_skip_lines: usize,
+) -> Vec<Line<'static>> {
+    let Some(active) = model.and_then(|model| model.active.as_ref()) else {
+        return Vec::new();
+    };
+    if active.is_active_viewport_placeholder() {
+        return Vec::new();
+    }
+    let mut skip = stream_skip_lines;
+    let mut lines = active.display_lines_with_stream_skip(width, DisplayMode::Active, &mut skip);
+    if lines.len() > height as usize {
+        let start = lines.len().saturating_sub(height as usize);
+        lines = lines.into_iter().skip(start).collect();
+    }
+    lines
+}
+
+pub(crate) fn active_streaming_lines(
+    model: Option<&TranscriptModel>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    model
+        .and_then(|model| model.active.as_ref())
+        .map(|active| active.streaming_display_lines(width))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 pub(crate) fn active_viewport_has_live_content(model: Option<&TranscriptModel>) -> bool {
     model
         .and_then(|model| model.active.as_ref())
@@ -394,6 +414,28 @@ fn cells_to_lines<'a>(
     out
 }
 
+fn cells_to_lines_with_stream_skip<'a>(
+    nodes: impl Iterator<Item = &'a TranscriptNode>,
+    width: u16,
+    mode: DisplayMode,
+    stream_skip_lines: &mut usize,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut previous_kind = None;
+    for node in nodes {
+        let _ = (node.id(), node.revision());
+        if !out.is_empty() {
+            let gap = previous_kind
+                .map(|previous| gap_lines_between(previous, &node.kind))
+                .unwrap_or(0);
+            out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
+        }
+        out.extend(node.display_lines_with_stream_skip(width, mode, stream_skip_lines));
+        previous_kind = Some(&node.kind);
+    }
+    out
+}
+
 pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
     let Some(previous) = model.committed.last() else {
         return 0;
@@ -406,9 +448,9 @@ pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
 
 fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize {
     match (previous, next) {
-        (_, TranscriptKind::Prompt { .. } | TranscriptKind::PendingPrompt { .. }) => 1,
+        (_, TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. }) => 1,
         (
-            TranscriptKind::Prompt { .. } | TranscriptKind::PendingPrompt { .. },
+            TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
             TranscriptKind::Assistant { .. }
             | TranscriptKind::StreamingAssistant { .. }
             | TranscriptKind::Timeline { .. }
@@ -970,7 +1012,8 @@ fn active_node_for_session(
         .last()
         .and_then(|turn| turn.streaming_text.as_deref())
         .map(str::trim_end)
-        .filter(|text| !text.is_empty());
+        .filter(|text| !text.is_empty())
+        .filter(|_| !live_stream_has_committed_successor(live_events));
 
     let mut active_nodes = Vec::new();
 
@@ -978,12 +1021,8 @@ fn active_node_for_session(
     if let Some(event) = live_events.iter().rev().find(|event| {
         matches!(
             event.event_type.as_str(),
-            "model.turn.request" | "model.turn.retry" | "agent.wait.started"
-        ) && !(suppress_model_wait
-            && matches!(
-                event.event_type.as_str(),
-                "model.turn.request" | "model.turn.retry"
-            ))
+            "model.turn.retry" | "agent.wait.started"
+        ) && !(suppress_model_wait && matches!(event.event_type.as_str(), "model.turn.retry"))
     }) {
         if let Some(node) = active_node_for_event(root, events, event) {
             active_nodes.push(node);
@@ -1081,13 +1120,49 @@ fn pending_followup_active_node(
     if has_live_output_after {
         return None;
     }
-    let text = payload_string(latest_followup, "text")?;
     let status = pending_followup_status(app, events, latest_followup.seq);
     Some(TranscriptNode {
         id: format!("{}:active-followup:{}", root.id, latest_followup.seq),
         seq: latest_followup.seq,
         revision: latest_followup.seq.max(0) as u64,
-        kind: TranscriptKind::PendingPrompt { text, status },
+        kind: TranscriptKind::PendingStatus { status },
+    })
+}
+
+fn live_stream_has_committed_successor(live_events: &[EventRecord]) -> bool {
+    let segment_start = live_events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "model.turn.request" | "model.turn.retry" | "model.turn.error"
+            )
+        })
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    let segment = live_events.get(segment_start..).unwrap_or_default();
+    let Some(latest_stream_seq) = segment
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == "model.stream_delta"
+                && event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+        })
+        .map(|event| event.seq)
+    else {
+        return false;
+    };
+    segment.iter().any(|event| {
+        event.seq > latest_stream_seq
+            && (matches!(
+                event.event_type.as_str(),
+                "session.done" | "session.failed" | "session.cancelled"
+            ) || (event.event_type == "model.turn.response"
+                && model_response_tool_call_count(event) > 0))
     })
 }
 
@@ -1110,10 +1185,7 @@ fn pending_followup_status(app: &App, events: &[EventRecord], after_seq: i64) ->
         .filter(|event| event.seq > after_seq)
         .rev()
         .find_map(|event| match event.event_type.as_str() {
-            "model.turn.request" => {
-                let model = payload_string(event, "model").unwrap_or_else(|| "model".to_string());
-                Some(format!("waiting for {model}"))
-            }
+            "model.turn.request" => Some("thinking".to_string()),
             "model.turn.retry" => Some("retrying model request".to_string()),
             "agent.wait.started" => Some("waiting for subagent".to_string()),
             "command.waiting" => Some("running command".to_string()),
@@ -1151,16 +1223,7 @@ fn active_node_for_event(
     event: &EventRecord,
 ) -> Option<TranscriptNode> {
     match event.event_type.as_str() {
-        "model.turn.request" => {
-            let model = payload_string(event, "model").unwrap_or_else(|| "model".to_string());
-            Some(active_status_node(
-                root,
-                events,
-                "thinking",
-                vec![format!("waiting for {model}")],
-                NodeStyle::Muted,
-            ))
-        }
+        "model.turn.request" => None,
         "model.turn.retry" => Some(active_status_node(
             root,
             events,
@@ -1389,6 +1452,13 @@ fn prompt_lines(text: &str, followup: bool, width: u16) -> Vec<Line<'static>> {
     prompt_lines_with_status(text, followup, width, None)
 }
 
+fn pending_status_lines(status: &str) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        Span::styled("  ".to_string(), user_prompt_accent()),
+        Span::styled(status.to_string(), user_prompt_muted()),
+    ])]
+}
+
 fn prompt_lines_with_status(
     text: &str,
     _followup: bool,
@@ -1521,14 +1591,9 @@ fn grouped_lines(
     lines
 }
 
-fn styled_value_spans(group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
+fn styled_value_spans(_group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
     if text.starts_with("https://") || text.starts_with("http://") {
         return vec![Span::styled(text.to_string(), link())];
-    }
-    if group == "run" && looks_like_shell_line(text) {
-        if let Some(spans) = highlight_code_line_spans(text, Some("bash")) {
-            return spans;
-        }
     }
     if let Some(spans) = styled_activity_line_spans(text, fallback) {
         return spans;
@@ -1548,11 +1613,7 @@ fn styled_activity_line_spans(text: &str, fallback: Style) -> Option<Vec<Span<'s
             activity_action_style(action),
         ));
         spans.push(Span::styled(" ".to_string(), fallback));
-        if let Some(command_spans) = highlight_code_line_spans(rest, Some("bash")) {
-            spans.extend(command_spans);
-        } else {
-            spans.extend(styled_path_tokens(rest, fallback));
-        }
+        spans.extend(styled_path_tokens(rest, fallback));
         return Some(spans);
     }
 
@@ -1608,7 +1669,7 @@ fn activity_action_style(action: &str) -> Style {
     match action {
         "run" | "read" | "list" | "search" | "artifact" | "command" => running(),
         "working" | "waiting" => thought(),
-        "task" | "follow-up" => user_prompt_accent(),
+        "task" | "follow-up" => accent(),
         _ => group_style(NodeStyle::Normal),
     }
 }
@@ -1705,19 +1766,6 @@ fn looks_like_command_line(text: &str) -> bool {
                 | "sqlite3"
         )
     )
-}
-
-fn looks_like_shell_line(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    looks_like_command_line(trimmed)
-        || trimmed.starts_with('|')
-        || trimmed.starts_with("&&")
-        || trimmed.starts_with("||")
-        || trimmed.contains(" | ")
-        || trimmed.contains(" && ")
-        || trimmed.contains(" || ")
-        || trimmed.contains(" > ")
-        || trimmed.contains(" < ")
 }
 
 fn looks_like_path_token(token: &str) -> bool {
@@ -2319,10 +2367,7 @@ fn child_activity_line(event: &EventRecord, state: &WorkbenchState) -> Option<St
                     Some(format!("command failed with exit {code}"))
                 }
             }),
-        "model.turn.request" => {
-            let model = payload_string(event, "model").unwrap_or_else(|| "model".to_string());
-            Some(format!("waiting for {model}"))
-        }
+        "model.turn.request" => None,
         "model.turn.retry" => Some("retrying model request".to_string()),
         "model.thinking_delta" | "model.stream_delta" | "model.tool_call" | "tool.started" => None,
         "tool.output" => {
@@ -2484,19 +2529,15 @@ mod tests {
     }
 
     #[test]
-    fn run_values_highlight_commands_and_paths() {
+    fn run_values_style_paths_without_command_syntax_highlighting() {
         let command_spans = styled_value_spans(
             "run",
             "find crates -maxdepth 3 -type f | sort",
             text_style(),
         );
-        assert!(command_spans.iter().any(|span| {
-            span.content.as_ref() == "find"
-                && span
-                    .style
-                    .fg
-                    .is_some_and(|color| color != crate::theme::text())
-        }));
+        assert!(command_spans
+            .iter()
+            .any(|span| span.content.as_ref() == "find" && span.style == text_style()));
 
         let path_spans = styled_value_spans(
             "run",
@@ -2512,7 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_activity_run_lines_highlight_commands() {
+    fn nested_activity_run_lines_style_action_but_not_command_syntax() {
         let spans = styled_value_spans(
             "subagent repo explorer",
             "run pwd && find . -maxdepth 2 -type f | sed 's# ./##' | sort | head -200",
@@ -2521,13 +2562,9 @@ mod tests {
         assert!(spans
             .iter()
             .any(|span| span.content.as_ref() == "run" && span.style == running()));
-        assert!(spans.iter().any(|span| {
-            span.content.as_ref() == "find"
-                && span
-                    .style
-                    .fg
-                    .is_some_and(|color| color != crate::theme::text())
-        }));
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "find" && span.style == text_style()));
         assert!(!spans
             .iter()
             .any(|span| span.content.contains("./##") && span.style == link()));
@@ -2545,7 +2582,7 @@ mod tests {
         );
         assert!(spans
             .iter()
-            .any(|span| span.content.as_ref() == "task" && span.style == user_prompt_accent()));
+            .any(|span| span.content.as_ref() == "task" && span.style == accent()));
         assert!(!spans
             .iter()
             .any(|span| span.content.contains("languages/frameworks") && span.style == link()));
@@ -2559,7 +2596,6 @@ mod tests {
     fn child_activity_state_words_are_highlighted() {
         for (line, expected_style) in [
             ("working", thought()),
-            ("waiting for gpt-5.5", thought()),
             ("list .", running()),
             ("read Taskfile.yml", running()),
         ] {

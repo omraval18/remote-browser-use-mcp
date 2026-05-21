@@ -11,13 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CLAUDE_CODE, ACCOUNT_CODEX,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES,
+    is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES,
 };
 use crate::theme::*;
 use crate::transcript;
 
-use super::{App, ProductState, Surface};
+use super::{App, ProductState, SetupResultKind, Surface};
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
 const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
@@ -182,8 +182,20 @@ fn render_main(
         None
     };
     let body = if native_scrollback_active {
-        let mut lines =
-            transcript::active_viewport_lines(transcript_model.as_ref(), body_width, max_body_h);
+        let stream_skip_lines = state
+            .current_session
+            .as_ref()
+            .map(|session| {
+                app.native_history
+                    .live_stream_emitted_lines_for(&session.id, body_width)
+            })
+            .unwrap_or(0);
+        let mut lines = transcript::active_viewport_lines_with_stream_skip(
+            transcript_model.as_ref(),
+            body_width,
+            max_body_h,
+            stream_skip_lines,
+        );
         if lines.is_empty() {
             if let Some(next) = next_action_lines(state, app, product_state) {
                 lines = next;
@@ -192,7 +204,7 @@ fn render_main(
         lines
     } else {
         match product_state {
-            ProductState::SetupNeeded => setup_lines(app),
+            ProductState::SetupNeeded => setup_lines(app, body_width as usize),
             ProductState::Ready => ready_lines(app, state, body_width, max_body_h),
             ProductState::Running
             | ProductState::Result
@@ -245,15 +257,22 @@ fn render_main(
     };
     trim_trailing_whitespace(&mut body);
     let body_content_rect = content_area(body_render_area);
-    if matches!(product_state, ProductState::Ready) && app.is_welcome_surface() {
-        app.welcome_logo_rect
-            .set(Some(crate::welcome::logo_screen_rect(
+    let logo_rect = if app.is_welcome_surface() {
+        match product_state {
+            ProductState::Ready => Some(crate::welcome::logo_screen_rect(
                 body_content_rect,
                 app.status_notice.is_some(),
-            )));
+            )),
+            ProductState::SetupNeeded => Some(setup_logo_screen_rect(body_content_rect)),
+            ProductState::Running
+            | ProductState::Result
+            | ProductState::Failed
+            | ProductState::Cancelled => None,
+        }
     } else {
-        app.welcome_logo_rect.set(None);
-    }
+        None
+    };
+    app.welcome_logo_rect.set(logo_rect);
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
@@ -862,14 +881,21 @@ fn render_surface(
         ])
         .split(area);
     frame.render_widget(Paragraph::new(header), chunks[0]);
-    let body_width = content_area(chunks[1]).width as usize;
+    let body_area = content_area(chunks[1]);
+    if surface == Surface::Setup {
+        app.welcome_logo_rect
+            .set(Some(setup_logo_screen_rect(body_area)));
+    } else {
+        app.welcome_logo_rect.set(None);
+    }
+    let body_width = body_area.width as usize;
     let mut lines = surface_lines(surface, app, state, body_width);
     trim_trailing_whitespace(&mut lines);
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        content_area(chunks[1]),
+        body_area,
     );
     frame.render_widget(
         Paragraph::new(surface_footer(surface))
@@ -882,7 +908,9 @@ fn render_surface(
 /// Title and one-line description for a dropdown/settings surface header.
 fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
     match surface {
-        Surface::Setup => ("Setup", "Get Browser Use ready to go"),
+        Surface::Setup => ("Setup", "Choose how to run Browser Use"),
+        Surface::SetupConfirm => ("Setup", "Confirm provider"),
+        Surface::SetupResult => ("Setup", "Connection result"),
         Surface::Account => ("Authenticate", "Sign in to a model provider"),
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
@@ -919,7 +947,8 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::ApiKey => "Enter:save | Esc:cancel",
         Surface::Telemetry => "Enter:save | Esc:cancel",
         Surface::History => "",
-        Surface::Setup => "Enter:continue | Esc:quit",
+        Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
+        Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::Developer => "Esc:close",
         _ => "Enter:select | Esc:back",
@@ -933,7 +962,9 @@ fn surface_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     match surface {
-        Surface::Setup => setup_lines(app),
+        Surface::Setup => setup_lines(app, width),
+        Surface::SetupConfirm => setup_confirm_lines(app),
+        Surface::SetupResult => setup_result_lines(app, width),
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
@@ -1318,60 +1349,336 @@ fn render_footer(
     );
 }
 
-fn setup_lines(app: &App) -> Vec<Line<'static>> {
+const SETUP_LOGO_W: usize = 18;
+const SETUP_LOGO_H: usize = 7;
+const SETUP_LOGO_GAP: usize = 8;
+const SETUP_RIGHT_W: usize = 58;
+const SETUP_CLICK_LABEL: &str = "click me!";
+const SETUP_CLICK_PREFIX_W: usize = 11;
+
+fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("browser-use setup", muted()),
-        Span::styled(" / ", dim()),
-        Span::styled("authenticate", bold()),
-        Span::styled(
-            " -------------------------------------------------------------- ",
-            dim(),
-        ),
-        Span::styled("step 1/3", muted()),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  CHOOSE ACCOUNT", muted())));
-    if let Some(notice) = app.status_notice.as_ref() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(notice.clone(), failed()),
-        ]));
+
+    let logo_rows = crate::welcome::render_braille_logo(
+        SETUP_LOGO_W,
+        SETUP_LOGO_H,
+        11.0,
+        1.1,
+        app.welcome_anim.rx,
+        app.welcome_anim.ry,
+    );
+    let right_lines = setup_account_lines(app);
+    let side_by_side = setup_logo_is_side_by_side(width);
+
+    if side_by_side {
+        let total_w = setup_side_by_side_width().min(width);
+        let left_pad = width.saturating_sub(total_w) / 2;
+        let mut left_lines = logo_rows
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, text_style())))
+            .collect::<Vec<_>>();
+        left_lines.push(Line::from(""));
+        left_lines.push(centered_line_in_width("Browser Use", SETUP_LOGO_W, bold()));
+        left_lines.push(centered_line_in_width("Terminal", SETUP_LOGO_W, muted()));
+
+        let row_count = left_lines.len().max(right_lines.len());
+        for idx in 0..row_count {
+            let show_click = idx == SETUP_LOGO_H / 2 && left_pad >= SETUP_CLICK_PREFIX_W;
+            let mut spans = if show_click {
+                vec![Span::raw(
+                    " ".repeat(left_pad.saturating_sub(SETUP_CLICK_PREFIX_W)),
+                )]
+            } else {
+                vec![Span::raw(" ".repeat(left_pad))]
+            };
+            if show_click {
+                spans.extend([
+                    Span::styled(SETUP_CLICK_LABEL.to_string(), accent()),
+                    Span::raw("  "),
+                ]);
+            }
+            if let Some(left) = left_lines.get(idx) {
+                spans.extend(left.spans.clone());
+            }
+            let used_left = left_lines
+                .get(idx)
+                .map(line_width)
+                .unwrap_or_default()
+                .min(SETUP_LOGO_W);
+            let gap_width = SETUP_LOGO_W
+                .saturating_sub(used_left)
+                .saturating_add(SETUP_LOGO_GAP);
+            spans.push(Span::raw(" ".repeat(gap_width)));
+            if let Some(right) = right_lines.get(idx) {
+                spans.extend(right.spans.clone());
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        if setup_stacked_logo_has_side_label(width) {
+            let logo_pad = width.saturating_sub(SETUP_LOGO_W) / 2;
+            for (idx, row) in logo_rows.into_iter().enumerate() {
+                let show_click = idx == SETUP_LOGO_H / 2 && logo_pad >= SETUP_CLICK_PREFIX_W;
+                let mut spans = if show_click {
+                    vec![Span::raw(
+                        " ".repeat(logo_pad.saturating_sub(SETUP_CLICK_PREFIX_W)),
+                    )]
+                } else {
+                    vec![Span::raw(" ".repeat(logo_pad))]
+                };
+                if show_click {
+                    spans.extend([
+                        Span::styled(SETUP_CLICK_LABEL.to_string(), accent()),
+                        Span::raw("  "),
+                    ]);
+                }
+                spans.push(Span::styled(row, text_style()));
+                lines.push(Line::from(spans));
+            }
+        } else {
+            let logo_pad = " ".repeat(width.saturating_sub(SETUP_LOGO_W) / 2);
+            for row in logo_rows {
+                lines.push(Line::from(Span::styled(
+                    format!("{logo_pad}{row}"),
+                    text_style(),
+                )));
+            }
+        }
         lines.push(Line::from(""));
+        lines.push(centered_line("Browser Use", width, bold()));
+        lines.push(centered_line("Terminal", width, muted()));
+        lines.push(Line::from(""));
+        lines.extend(right_lines);
     }
-    let options: [(&str, &str); 5] = [
-        (ACCOUNT_CODEX, "uses your ChatGPT plan"),
-        (ACCOUNT_CLAUDE_CODE, "uses your Claude Pro/Max"),
-        (ACCOUNT_OPENAI, "bring your own key"),
-        (ACCOUNT_ANTHROPIC, "bring your own key"),
-        (ACCOUNT_OPENROUTER, "many models, one key"),
-    ];
-    for (idx, (label, hint)) in options.iter().enumerate() {
-        lines.push(setup_account_row(*label, *hint, idx, app.selected_row));
+
+    lines
+}
+
+fn setup_logo_is_side_by_side(width: usize) -> bool {
+    width >= setup_side_by_side_width().saturating_add(SETUP_CLICK_PREFIX_W.saturating_mul(2))
+}
+
+fn setup_side_by_side_width() -> usize {
+    SETUP_LOGO_W + SETUP_LOGO_GAP + SETUP_RIGHT_W
+}
+
+fn setup_stacked_logo_has_side_label(width: usize) -> bool {
+    width >= SETUP_LOGO_W
+}
+
+fn setup_logo_screen_rect(body_rect: Rect) -> Rect {
+    let width = body_rect.width as usize;
+    let x_offset = if setup_logo_is_side_by_side(width) {
+        let total_w = setup_side_by_side_width().min(width);
+        width.saturating_sub(total_w) / 2
+    } else if setup_stacked_logo_has_side_label(width) {
+        width.saturating_sub(SETUP_LOGO_W) / 2
+    } else {
+        width.saturating_sub(SETUP_LOGO_W) / 2
+    };
+    Rect {
+        x: body_rect.x.saturating_add(x_offset as u16),
+        y: body_rect.y,
+        width: SETUP_LOGO_W as u16,
+        height: (SETUP_LOGO_H as u16).min(body_rect.height),
+    }
+}
+
+fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled("CHOOSE PROVIDER", muted())));
+    lines.push(Line::from(""));
+
+    for (idx, label) in ACCOUNT_CHOICES.iter().enumerate() {
+        lines.push(setup_account_row(label, idx, app.selected_row));
     }
     lines.extend([
         Line::from(""),
-        Line::from(Span::styled(
-            "--------------------------------------------------------------------------------",
-            dim(),
-        )),
         Line::from(Span::styled("enter select     esc quit", muted())),
     ]);
     lines
 }
 
-fn setup_account_row(label: &str, hint: &str, idx: usize, selected_row: usize) -> Line<'static> {
+fn setup_account_row(label: &str, idx: usize, selected_row: usize) -> Line<'static> {
     let is_selected = idx == selected_row;
-    let chev = if is_selected { ">" } else { " " };
-    let chev_style = if is_selected { accent() } else { dim() };
-    let label_style = if is_selected { bold() } else { text_style() };
     Line::from(vec![
-        Span::raw("  "),
-        Span::styled(chev.to_string(), chev_style),
-        Span::raw("  "),
-        Span::styled(format!("{label:<28}"), label_style),
-        Span::styled(hint.to_string(), muted()),
+        Span::styled(
+            if is_selected { "> " } else { "  " },
+            if is_selected { accent() } else { dim() },
+        ),
+        Span::styled(
+            label.to_string(),
+            if is_selected { bold() } else { text_style() },
+        ),
     ])
+}
+
+fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
+    let account = app
+        .setup_pending_account
+        .as_deref()
+        .unwrap_or(ACCOUNT_CODEX);
+    let mut lines = vec![
+        Line::from(Span::styled(format!("Use {account}?"), bold())),
+        Line::from(""),
+    ];
+    if account == ACCOUNT_CODEX {
+        lines.extend([
+            Line::from("  Imports your local Codex auth."),
+            Line::from("  Uses GPT-5.5 with your ChatGPT plan."),
+            Line::from("  No API key is required."),
+        ]);
+    } else if is_claude_code_account(account) {
+        if app.account_ready(account).unwrap_or(false) {
+            lines.push(Line::from("  Claude Code login found."));
+        } else {
+            lines.extend([
+                Line::from("  Opens Anthropic OAuth sign-in in your browser."),
+                Line::from("  Browser Use waits here for the localhost callback."),
+                Line::from("  No API key or second terminal is required."),
+            ]);
+        }
+    } else {
+        lines.extend([
+            Line::from("  Your key will be entered in the API key modal."),
+            Line::from("  We confirm that the key was saved locally."),
+        ]);
+    }
+    let primary_label =
+        if is_claude_code_account(account) && !app.account_ready(account).unwrap_or(false) {
+            "Open sign-in"
+        } else if account == ACCOUNT_CODEX {
+            "Use Codex auth"
+        } else {
+            "Continue"
+        };
+    lines.extend([
+        Line::from(""),
+        selected(primary_label, 0, app.selected_row),
+        selected("Back", 1, app.selected_row),
+    ]);
+    lines
+}
+
+fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let Some(result) = app.setup_result.as_ref() else {
+        return vec![
+            Line::from(Span::styled("No setup result.", failed())),
+            Line::from(""),
+            selected("Back", 0, app.selected_row),
+        ];
+    };
+    let is_success = result.kind == SetupResultKind::Success;
+    let is_pending = result.kind == SetupResultKind::Pending;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            result.message.clone(),
+            if is_success {
+                done()
+            } else if is_pending {
+                muted()
+            } else {
+                failed()
+            },
+        )),
+        Line::from(""),
+        Line::from(format!("  {}", result.account)),
+    ];
+    if is_success {
+        let next_message = if app.pending_model_after_auth.is_some() {
+            "  Continue applies the selected model."
+        } else {
+            "  A default model will be selected automatically."
+        };
+        lines.extend([
+            Line::from(Span::styled(next_message, muted())),
+            Line::from(""),
+            selected("Continue", 0, app.selected_row),
+        ]);
+    } else if is_pending {
+        if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
+            lines.push(Line::from(Span::styled(
+                format!("  Waiting for callback ({seconds}s)."),
+                muted(),
+            )));
+        }
+        if let Some(error) = app.claude_code_oauth_open_error() {
+            lines.push(Line::from(Span::styled(
+                format!("  Could not open browser automatically: {error}"),
+                failed(),
+            )));
+        } else {
+            lines.push(Line::from("  Browser sign-in opened."));
+        }
+        if let Some(url) = app.claude_code_oauth_url() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("  OAuth link:"));
+            push_wrapped_prefixed_text(&mut lines, "    ", url, width);
+        }
+        lines.extend([
+            Line::from(""),
+            selected("Open browser again", 0, app.selected_row),
+            selected("Back", 1, app.selected_row),
+        ]);
+    } else {
+        if is_claude_code_account(&result.account) {
+            lines.extend([
+                Line::from(""),
+                Line::from("  Start the OAuth sign-in again from here."),
+            ]);
+        }
+        lines.extend([
+            Line::from(""),
+            selected("Retry", 0, app.selected_row),
+            selected("Back", 1, app.selected_row),
+        ]);
+    }
+    lines
+}
+
+fn push_wrapped_prefixed_text(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    width: usize,
+) {
+    let available = width.saturating_sub(prefix.chars().count()).max(20);
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + available).min(text.len());
+        while !text.is_char_boundary(end) && end > start {
+            end -= 1;
+        }
+        if end == start {
+            end = text.len();
+        }
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", &text[start..end]),
+            text_style(),
+        )));
+        start = end;
+    }
+}
+
+fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ".repeat(width.saturating_sub(text.chars().count()) / 2)),
+        Span::styled(text.to_string(), style),
+    ])
+}
+
+fn centered_line_in_width(text: &str, width: usize, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ".repeat(width.saturating_sub(text.chars().count()) / 2)),
+        Span::styled(text.to_string(), style),
+    ])
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
 }
 
 fn account_lines(app: &App) -> Vec<Line<'static>> {
@@ -1387,7 +1694,7 @@ fn account_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     for (idx, account) in ACCOUNT_CHOICES.iter().enumerate() {
-        let status = if *account == "Codex login" || app.account_ready(account).unwrap_or(false) {
+        let status = if app.account_ready(account).unwrap_or(false) {
             "connected"
         } else if account.contains("API key") {
             "needs key"
@@ -1413,20 +1720,6 @@ fn api_key_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("  Add this key once, or export BROWSER_USE_API_KEY before launch."),
             Line::from(""),
         ]);
-    } else if is_claude_code_account(account) {
-        lines.extend([
-            Line::from("  Claude Code uses Browser Use's Anthropic OAuth login."),
-            Line::from("  Run this in another terminal to open the browser sign-in:"),
-            Line::from(Span::styled(
-                "    browser-use-terminal auth login claude-code",
-                text_style(),
-            )),
-            Line::from(Span::styled(
-                "  This stores the refreshable Claude Code credential locally.",
-                muted(),
-            )),
-            Line::from(""),
-        ]);
     }
     lines.extend([
         Line::from(format!(
@@ -1437,8 +1730,6 @@ fn api_key_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(Span::styled(
             if account == BROWSER_USE_CLOUD {
                 "  Stored locally and passed to browser worker as BROWSER_USE_API_KEY."
-            } else if is_claude_code_account(account) {
-                "  Pasted values are treated as legacy access tokens. Prefer the login command above."
             } else {
                 "  This key is stored locally in browser-use state."
             },
