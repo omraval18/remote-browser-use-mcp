@@ -67,6 +67,12 @@ enum TranscriptKind {
     StreamingAssistant {
         markdown: String,
     },
+    ResultFile {
+        file_path: String,
+        bytes: Option<u64>,
+        mime: Option<String>,
+        source: Option<String>,
+    },
     Timeline {
         group: String,
         lines: Vec<String>,
@@ -124,6 +130,18 @@ impl TranscriptNode {
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, mode)
             }
+            TranscriptKind::ResultFile {
+                file_path,
+                bytes,
+                mime,
+                source,
+            } => {
+                let mut lines = result_file_lines(file_path, *bytes, mime.as_deref(), width);
+                if let Some(source) = source.as_deref() {
+                    lines.extend(source_display_lines(source, width));
+                }
+                lines
+            }
             TranscriptKind::Timeline {
                 group,
                 lines,
@@ -167,6 +185,18 @@ impl TranscriptNode {
             }
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown.lines().map(str::to_string).collect()
+            }
+            TranscriptKind::ResultFile {
+                file_path,
+                bytes,
+                mime,
+                source,
+            } => {
+                let mut out = result_file_plain_lines(file_path, *bytes, mime.as_deref());
+                if let Some(source) = source.as_ref() {
+                    out.push(format!("source {source}"));
+                }
+                out
             }
             TranscriptKind::Timeline { group, lines, .. }
             | TranscriptKind::ActiveStatus { group, lines, .. } => {
@@ -546,6 +576,7 @@ fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize 
         (
             TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
             TranscriptKind::Assistant { .. }
+            | TranscriptKind::ResultFile { .. }
             | TranscriptKind::StreamingAssistant { .. }
             | TranscriptKind::Timeline { .. }
             | TranscriptKind::ActiveStatus { .. }
@@ -581,7 +612,20 @@ fn committed_node_for_event(
             })
         }
         "session.done" => {
-            let result = session_done_result_text(event, state)?;
+            if let Some(result_file) = session_done_result_file(event, state) {
+                return Some(TranscriptNode {
+                    id,
+                    seq: event.seq,
+                    revision: event.seq.max(0) as u64,
+                    kind: TranscriptKind::ResultFile {
+                        file_path: result_file.file_path,
+                        bytes: result_file.bytes,
+                        mime: result_file.mime,
+                        source: source_for_state(state),
+                    },
+                });
+            }
+            let result = session_done_result_text(event)?;
             Some(TranscriptNode {
                 id,
                 seq: event.seq,
@@ -1417,12 +1461,12 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
     ))
 }
 
-fn artifact_created_node(event: &EventRecord, state: &WorkbenchState) -> Option<TranscriptNode> {
+fn artifact_created_node(event: &EventRecord, _state: &WorkbenchState) -> Option<TranscriptNode> {
     let artifact = event.payload.get("artifact")?;
     let path = artifact
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .map(|path| display_path(path, state))?;
+        .map(ToOwned::to_owned)?;
     let kind = artifact
         .get("kind")
         .and_then(serde_json::Value::as_str)
@@ -1922,7 +1966,7 @@ fn looks_like_path_token(token: &str) -> bool {
 }
 
 fn reference_token_style(token: &str) -> Style {
-    if looks_like_url_token(token) {
+    if looks_like_url_token(token) || looks_like_absolute_path_token(token) {
         link()
     } else {
         path_reference()
@@ -1930,7 +1974,11 @@ fn reference_token_style(token: &str) -> Style {
 }
 
 fn looks_like_url_token(token: &str) -> bool {
-    token.starts_with("http://") || token.starts_with("https://")
+    token.starts_with("http://") || token.starts_with("https://") || token.starts_with("file://")
+}
+
+fn looks_like_absolute_path_token(token: &str) -> bool {
+    token.starts_with('/')
 }
 
 fn source_extension(token: &str) -> Option<&str> {
@@ -2088,50 +2136,95 @@ fn display_path(path: &str, state: &WorkbenchState) -> String {
         .to_string()
 }
 
-fn session_done_result_text(event: &EventRecord, state: &WorkbenchState) -> Option<String> {
-    if event.payload.get("result_file").is_some() {
-        return Some(session_done_result_file_text(event, state));
-    }
+#[derive(Clone, Debug)]
+struct ResultFileDisplay {
+    file_path: String,
+    bytes: Option<u64>,
+    mime: Option<String>,
+}
+
+fn session_done_result_text(event: &EventRecord) -> Option<String> {
     payload_string(event, "result").map(|result| normalize_result_text(&result))
 }
 
-fn session_done_result_file_text(event: &EventRecord, state: &WorkbenchState) -> String {
+fn session_done_result_file(
+    event: &EventRecord,
+    state: &WorkbenchState,
+) -> Option<ResultFileDisplay> {
+    event.payload.get("result_file")?;
     let file_path = payload_string(event, "result_file_path")
         .or_else(|| resolved_result_file_path(event, state).map(|path| path.display().to_string()))
         .or_else(|| payload_string(event, "result_file"))
         .unwrap_or_else(|| "<unknown>".to_string());
-    let directory_path = payload_string(event, "result_file_directory").or_else(|| {
-        resolved_result_file_path(event, state)
-            .and_then(|path| path.parent().map(|path| path.display().to_string()))
-    });
     let bytes = event
         .payload
         .get("result_file_bytes")
         .and_then(serde_json::Value::as_u64);
     let mime = payload_string(event, "result_file_mime");
 
-    let file_display = display_path(&file_path, state);
-    let mut text = format!("Saved result file\n\nFile      {file_display}");
-    if let Some(directory_path) = directory_path {
-        text.push_str(&format!(
-            "\nFolder    {}",
-            display_path(&directory_path, state)
-        ));
+    Some(ResultFileDisplay {
+        file_path,
+        bytes,
+        mime,
+    })
+}
+
+fn result_file_lines(
+    file_path: &str,
+    bytes: Option<u64>,
+    mime: Option<&str>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled("Saved result file", text_style())),
+        Line::from(""),
+    ];
+    let path_style = result_file_path_style(file_path);
+    lines.extend(
+        wrap_plain(file_path, width)
+            .into_iter()
+            .map(|(_, line)| Line::from(Span::styled(line, path_style))),
+    );
+    if let Some(metadata) = result_file_metadata(bytes, mime) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(metadata, muted())));
     }
-    match (bytes, mime.as_deref()) {
-        (Some(bytes), Some(mime)) => {
-            text.push_str(&format!("\nSize      {} · {mime}", format_bytes(bytes)));
-        }
-        (Some(bytes), None) => {
-            text.push_str(&format!("\nSize      {}", format_bytes(bytes)));
-        }
-        (None, Some(mime)) => {
-            text.push_str(&format!("\nType      {mime}"));
-        }
-        (None, None) => {}
+    lines
+}
+
+fn result_file_plain_lines(file_path: &str, bytes: Option<u64>, mime: Option<&str>) -> Vec<String> {
+    let mut lines = vec![
+        "Saved result file".to_string(),
+        String::new(),
+        file_path.to_string(),
+    ];
+    if let Some(metadata) = result_file_metadata(bytes, mime) {
+        lines.push(String::new());
+        lines.push(metadata);
     }
-    text.push_str("\n\nFull contents are saved on disk, not inlined into the terminal.");
-    text
+    lines
+}
+
+fn result_file_path_style(file_path: &str) -> Style {
+    if file_path.starts_with('/') || file_path.starts_with("file://") {
+        link()
+    } else {
+        path_reference()
+    }
+}
+
+fn result_file_metadata(bytes: Option<u64>, mime: Option<&str>) -> Option<String> {
+    let mime = mime.and_then(display_result_file_mime);
+    match (bytes, mime) {
+        (Some(bytes), Some(mime)) => Some(format!("{} · {mime}", format_bytes(bytes))),
+        (Some(bytes), None) => Some(format_bytes(bytes)),
+        (None, Some(mime)) => Some(mime.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn display_result_file_mime(mime: &str) -> Option<&str> {
+    (mime != "application/octet-stream").then_some(mime)
 }
 
 fn resolved_result_file_path(event: &EventRecord, state: &WorkbenchState) -> Option<PathBuf> {
@@ -2635,6 +2728,24 @@ mod tests {
             line.spans
                 .iter()
                 .any(|span| span.content.contains("https://") && span.style == link())
+        }));
+    }
+
+    #[test]
+    fn result_file_lines_render_full_path_as_clickable_text() {
+        let path = "/tmp/browser use/artifacts/session/result.json";
+        let lines = result_file_lines(path, Some(2048), Some("application/octet-stream"), 120);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("Saved result file"), "{text}");
+        assert!(text.contains(path), "{text}");
+        assert!(text.contains("2.0 KB"), "{text}");
+        assert!(!text.contains("file://"), "{text}");
+        assert!(!text.contains("application/octet-stream"), "{text}");
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == path && span.style == link())
         }));
     }
 

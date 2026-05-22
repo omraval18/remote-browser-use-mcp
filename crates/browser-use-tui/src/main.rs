@@ -3537,7 +3537,7 @@ fn collect_native_hyperlink_segments(lines: &[Line<'static>]) -> Vec<NativeHyper
             flush_pending_hyperlink(&mut out, &mut pending);
             for fragment in fragments {
                 let trimmed = fragment.text.trim();
-                if looks_like_clickable_url(trimmed) {
+                if clickable_target_for_link_text(trimmed).is_some() {
                     out.push(NativeHyperlinkSegment {
                         line: line_idx,
                         start_col: fragment.start_col,
@@ -3553,7 +3553,7 @@ fn collect_native_hyperlink_segments(lines: &[Line<'static>]) -> Vec<NativeHyper
             continue;
         };
         let first_text = first_fragment.text.trim();
-        if looks_like_clickable_url(first_text) {
+        if clickable_target_for_link_text(first_text).is_some() {
             flush_pending_hyperlink(&mut out, &mut pending);
             pending = Some(PendingNativeHyperlink {
                 target: String::new(),
@@ -3587,7 +3587,7 @@ fn flush_pending_hyperlink(
     let Some(group) = pending.take() else {
         return;
     };
-    if !looks_like_clickable_url(&group.target) {
+    if clickable_target_for_link_text(&group.target).is_none() {
         return;
     }
     out.extend(
@@ -3625,8 +3625,31 @@ fn line_has_only_link_text(line: &Line<'static>) -> bool {
         .all(|span| span.content.trim().is_empty() || span.style == theme::link())
 }
 
-fn looks_like_clickable_url(value: &str) -> bool {
-    value.starts_with("https://") || value.starts_with("http://") || value.starts_with("file://")
+fn clickable_target_for_link_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    if value.starts_with("https://") || value.starts_with("http://") || value.starts_with("file://")
+    {
+        return Some(value.replace('\\', "%5C"));
+    }
+    value
+        .starts_with('/')
+        .then(|| format!("file://{}", percent_encode_file_url_path(value)))
+}
+
+fn percent_encode_file_url_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' | b':' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyperlinkSegment]) {
@@ -3650,7 +3673,7 @@ fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyp
             continue;
         }
         let end_x = start_x + visible_width as u16 - 1;
-        let Some(target) = osc8_safe_url(&segment.target) else {
+        let Some(target) = clickable_target_for_link_text(&segment.target) else {
             continue;
         };
         let open = format!("\x1b]8;;{target}\x1b\\");
@@ -3668,14 +3691,6 @@ fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyp
         let last_symbol = buf[(end_x, y)].symbol().to_string();
         buf[(end_x, y)].set_symbol(&format!("{last_symbol}{close}"));
     }
-}
-
-fn osc8_safe_url(value: &str) -> Option<String> {
-    let value = value.trim();
-    if !looks_like_clickable_url(value) || value.chars().any(char::is_control) {
-        return None;
-    }
-    Some(value.replace('\\', "%5C"))
 }
 
 fn insert_initial_native_lines(
@@ -5699,11 +5714,10 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
 
         assert!(screen.contains("Saved result file"), "{screen}");
-        assert!(screen.contains("File"), "{screen}");
-        assert!(screen.contains("Folder"), "{screen}");
         assert!(screen.contains("comments.json"), "{screen}");
+        assert!(!screen.contains("Folder"), "{screen}");
         assert!(
-            screen.contains("Full contents are saved on disk"),
+            !screen.contains("Full contents are saved on disk"),
             "{screen}"
         );
         assert!(!screen.contains("file://"), "{screen}");
@@ -5865,6 +5879,27 @@ mod redesign_tests {
             "file:///home/alex/projects/browser-use/experiments/llm-browser/.browser-use-terminal/artifacts/session/result.json"
         );
         assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
+    }
+
+    #[test]
+    fn absolute_file_path_native_links_encode_to_file_urls() {
+        let lines = vec![Line::from(ratatui::text::Span::styled(
+            "/tmp/browser use/result #1.json",
+            theme::link(),
+        ))];
+
+        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        assert_eq!(hyperlinks.len(), 1);
+        assert_eq!(hyperlinks[0].target, "/tmp/browser use/result #1.json");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
+        let area = buffer.area;
+        Paragraph::new(lines).render(area, &mut buffer);
+        apply_native_hyperlinks(&mut buffer, area, &hyperlinks);
+
+        assert!(buffer[(0, 0)]
+            .symbol()
+            .starts_with("\x1b]8;;file:///tmp/browser%20use/result%20%231.json\x1b\\/"));
     }
 
     #[test]
