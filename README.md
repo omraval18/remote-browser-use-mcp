@@ -29,34 +29,19 @@ browser
 ## How It Works
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                         browser                             │
-├─────────────────────────────────────────────────────────────┤
-│  terminal UI                                                │
-│  custom Ratatui renderer, native scrollback, keyboard UX     │
-├─────────────────────────────────────────────────────────────┤
-│  Rust LLM harness                                           │
-│  provider loop, tools, subagents, compaction, cancellation   │
-├─────────────────────────────────────────────────────────────┤
-│  event store                                                │
-│  SQLite history, artifacts, screenshots, follow-ups, traces  │
-├─────────────────────────────────────────────────────────────┤
-│  browser runtime                                            │
-│  connect, profiles, doctor, recovery, ownership             │
-├─────────────────────────────────────────────────────────────┤
-│  browser interaction                                        │
-│  direct CDP, page JS, screenshots, files, helper workspace   │
-├─────────────────────────────────────────────────────────────┤
-│  Chrome                                                     │
-│  real logged-in Chrome, headless Chromium, or cloud browser  │
-└─────────────────────────────────────────────────────────────┘
+you
+ │
+ ▼
+browser terminal
+ │
+ ├─ custom Ratatui UI      watch · steer · stop · resume
+ ├─ Rust LLM harness       tools · subagents · compaction · cancellation
+ ├─ SQLite event log       history · screenshots · artifacts · traces
+ └─ CDP browser runtime    profiles · doctor · recovery · ownership
+      │
+      ▼
+ real Chrome  |  headless Chromium  |  Browser Use cloud
 ```
-
-The harness is built from scratch around browser work. The model gets a CDP-first action space instead of a narrow framework API, while Rust keeps the durable state: task history, tool calls, artifacts, browser status, cancellation, follow-ups, and subagents.
-
-The TUI is not a log dump. It has a custom Ratatui renderer that keeps completed output in native terminal scrollback, renders only live state in the active viewport, and drives real keyboard flows for history, browser controls, model/auth setup, steering, stopping, and retrying.
-
-Browser state is explicit: connect, profile, doctor, recover, stop. No mystery browser session hiding behind the agent loop.
 
 ## Try It
 
