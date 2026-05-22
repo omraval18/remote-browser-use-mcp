@@ -6,6 +6,7 @@ ARTIFACT_DIR="${BUT_DESIGN_LOOP_DIR:-/tmp/but-design-loop}"
 
 cd "$ROOT"
 mkdir -p "$ARTIFACT_DIR"
+export BUT_TELEMETRY=0
 
 echo "== cargo fmt =="
 cargo fmt --check

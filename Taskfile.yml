@@ -5,13 +5,15 @@ tasks:
     desc: Run the browser-use CLI from source, forwarding args after --
     silent: true
     cmds:
-      - cargo run -p browser-use-cli -- {{.CLI_ARGS}}
+      - BUT_TELEMETRY="${BUT_TELEMETRY:-0}" cargo run -p browser-use-cli -- {{.CLI_ARGS}}
 
   tui:dev:
+    aliases:
+      - dev
     desc: Run the browser-use TUI from source, forwarding args after --
     silent: true
     cmds:
-      - cargo run -p browser-use-tui -- {{.CLI_ARGS}}
+      - BUT_TELEMETRY="${BUT_TELEMETRY:-0}" cargo run -p browser-use-tui -- {{.CLI_ARGS}}
 
   reset:onboarding:
     aliases:

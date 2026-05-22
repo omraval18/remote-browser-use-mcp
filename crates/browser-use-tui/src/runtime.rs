@@ -78,9 +78,13 @@ fn tui_agent_options(
     browser_use_cloud_api_key: Option<&str>,
 ) -> AgentRunOptions {
     match browser {
-        "Headless Chromium" => AgentRunOptions::default().with_browser_mode("managed-headless"),
+        "Headless Chromium" => AgentRunOptions::default()
+            .with_browser_mode("managed-headless")
+            .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
-            let mut options = AgentRunOptions::default().with_browser_mode("cloud");
+            let mut options = AgentRunOptions::default()
+                .with_browser_mode("cloud")
+                .with_analytics_source("tui");
             if let Some(api_key) =
                 browser_use_cloud_api_key.filter(|value| !value.trim().is_empty())
             {
@@ -91,7 +95,9 @@ fn tui_agent_options(
             }
             options
         }
-        _ => AgentRunOptions::default().with_browser_mode("local"),
+        _ => AgentRunOptions::default()
+            .with_browser_mode("local")
+            .with_analytics_source("tui"),
     }
 }
 

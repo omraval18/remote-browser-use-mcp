@@ -362,7 +362,7 @@ def start_session(
     tmux("resize-window", "-t", session, "-x", "120", "-y", "28")
     select_arg = "--select-latest " if select_latest else ""
     command = (
-        f"cd {ROOT} && {binary} "
+        f"cd {ROOT} && BUT_TELEMETRY=0 {binary} "
         f"--state-dir {state_dir} --seed-demo {seed_demo} {select_arg}"
         "--agent none --browser 'Local Chrome' --height 28"
     )
@@ -467,7 +467,8 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(after_paste_clear, "paste two", "ctrl+c should clear pasted composer text")
 
         tmux_send(session, "/")
-        palette = wait_for(session, "/task", "slash-palette-open")
+        palette = wait_for(session, "/auth", "slash-palette-open")
+        assert_contains(palette, "/task", "slash palette should show the first product action")
         assert_contains(palette, "/auth", "slash palette should fit every product action")
         assert_contains(palette, "↑↓ navigate", "slash palette footer should be visible")
         assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")

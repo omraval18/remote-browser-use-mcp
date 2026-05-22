@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,14 +6,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod product_analytics;
 mod telemetry;
 mod tools;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
-    failure_from_events, result_from_events, sanitized_agent_context_from_events, ModelEvent,
-    SessionMeta, SessionStatus, ToolCall, ToolSpec,
+    failure_from_events, result_from_events, sanitized_agent_context_from_events, EventRecord,
+    ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
 use browser_use_providers::{
     load_codex_auth, refresh_claude_code_oauth, AnthropicMessagesProvider,
@@ -125,6 +126,9 @@ pub struct AgentRunOptions {
     pub python_tool_timeout_seconds: u64,
     pub python_env: Vec<(String, String)>,
     pub child_agent_runner: Option<ChildAgentRunner>,
+    pub analytics_source: Option<String>,
+    pub analytics_provider_kind: Option<String>,
+    pub analytics_model: Option<String>,
 }
 
 impl Default for AgentRunOptions {
@@ -136,6 +140,9 @@ impl Default for AgentRunOptions {
             python_tool_timeout_seconds: 120,
             python_env: Vec::new(),
             child_agent_runner: None,
+            analytics_source: None,
+            analytics_provider_kind: None,
+            analytics_model: None,
         }
     }
 }
@@ -158,6 +165,11 @@ impl AgentRunOptions {
 
     pub fn with_child_agent_runner(mut self, runner: ChildAgentRunner) -> Self {
         self.child_agent_runner = Some(runner);
+        self
+    }
+
+    pub fn with_analytics_source(mut self, source: impl Into<String>) -> Self {
+        self.analytics_source = Some(source.into());
         self
     }
 }
@@ -292,6 +304,9 @@ pub fn run_existing_session_from_config(
     mut config: ProviderRunConfig,
 ) -> Result<String> {
     install_config_child_agent_runner(store, &mut config);
+    config.options.analytics_provider_kind =
+        Some(provider_backend_kind(config.backend).to_string());
+    config.options.analytics_model = Some(config.model.clone());
     match config.backend {
         ProviderBackend::Codex => {
             let provider = codex_provider(store, config.model)?;
@@ -319,6 +334,17 @@ pub fn run_existing_session_from_config(
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
         ProviderBackend::None => Ok(session_id.to_string()),
+    }
+}
+
+fn provider_backend_kind(backend: ProviderBackend) -> &'static str {
+    match backend {
+        ProviderBackend::Codex => "codex",
+        ProviderBackend::Openai => "openai",
+        ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Openrouter => "openrouter",
+        ProviderBackend::Fake => "fake",
+        ProviderBackend::None => "none",
     }
 }
 
@@ -581,6 +607,90 @@ fn setting_or_env_or_default(
     Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
 }
 
+fn task_analytics_properties(session: &SessionMeta, options: &AgentRunOptions) -> Value {
+    json!({
+        "surface": options
+            .analytics_source
+            .as_deref()
+            .unwrap_or("core"),
+        "provider_kind": options
+            .analytics_provider_kind
+            .as_deref()
+            .unwrap_or("unknown"),
+        "model": options
+            .analytics_model
+            .as_deref()
+            .unwrap_or("unknown"),
+        "browser_kind": product_analytics::browser_kind(options.browser_mode.as_deref()),
+        "is_child_task": session.parent_id.is_some(),
+    })
+}
+
+fn task_analytics_summary_from_events(events: &[EventRecord]) -> Value {
+    let mut model_invocation_count = 0_i64;
+    let mut input_tokens = 0_i64;
+    let mut input_cached_tokens = 0_i64;
+    let mut input_cache_creation_tokens = 0_i64;
+    let mut output_tokens = 0_i64;
+    let mut total_tokens = 0_i64;
+    let mut tool_counts = BTreeMap::<String, i64>::new();
+
+    for event in events {
+        match event.event_type.as_str() {
+            "model.usage" => {
+                model_invocation_count += 1;
+                let event_input_tokens = json_payload_i64(&event.payload, "input_tokens");
+                let event_output_tokens = json_payload_i64(&event.payload, "output_tokens");
+                let event_total_tokens = json_payload_i64(&event.payload, "total_tokens");
+
+                input_tokens += event_input_tokens;
+                input_cached_tokens += json_payload_i64(&event.payload, "input_cached_tokens");
+                input_cache_creation_tokens +=
+                    json_payload_i64(&event.payload, "input_cache_creation_tokens");
+                output_tokens += event_output_tokens;
+                total_tokens += if event_total_tokens > 0 {
+                    event_total_tokens
+                } else {
+                    event_input_tokens + event_output_tokens
+                };
+            }
+            "model.tool_call" => {
+                if let Some(name) = event.payload.get("name").and_then(Value::as_str) {
+                    *tool_counts.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let tool_call_count = tool_counts.values().sum::<i64>();
+    let tool_names = tool_counts.keys().cloned().collect::<Vec<_>>();
+
+    json!({
+        "model_invocation_count": model_invocation_count,
+        "input_tokens": input_tokens,
+        "input_cached_tokens": input_cached_tokens,
+        "input_cache_creation_tokens": input_cache_creation_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "tool_call_count": tool_call_count,
+        "unique_tool_count": tool_counts.len(),
+        "tool_names": tool_names,
+        "tool_counts": tool_counts,
+    })
+}
+
+fn json_payload_i64(payload: &Value, key: &str) -> i64 {
+    payload.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn merge_object_properties(target: &mut Value, source: Value) {
+    let (Value::Object(target), Value::Object(source)) = (target, source) else {
+        return;
+    };
+    target.extend(source);
+}
+
 fn run_loaded_session_with_provider<P: ModelProvider>(
     store: &Store,
     provider: &P,
@@ -588,6 +698,19 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     mut messages: Vec<Value>,
     options: AgentRunOptions,
 ) -> Result<String> {
+    let analytics_started_at = Instant::now();
+    let analytics_source = options
+        .analytics_source
+        .as_deref()
+        .filter(|source| !source.trim().is_empty())
+        .unwrap_or("core")
+        .to_string();
+    let analytics_base = task_analytics_properties(&session, &options);
+    product_analytics::capture_async(
+        store,
+        format!("bu:{analytics_source} task started"),
+        analytics_base.clone(),
+    );
     let run_id = store.record_run_started(&session.id, Some(std::process::id() as i64))?;
     let telemetry = match AgentTelemetry::from_store(store) {
         Ok(telemetry) => telemetry,
@@ -958,6 +1081,32 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     } else {
         "failed"
     };
+    let event_status = if run_status == "done" {
+        "completed"
+    } else {
+        run_status
+    };
+    let mut final_analytics = analytics_base;
+    if let Value::Object(properties) = &mut final_analytics {
+        properties.insert("status".to_string(), Value::String(run_status.to_string()));
+        properties.insert(
+            "duration_bucket".to_string(),
+            Value::String(
+                product_analytics::duration_bucket(analytics_started_at.elapsed()).to_string(),
+            ),
+        );
+    }
+    if let Ok(events) = store.events_for_session(&session.id) {
+        merge_object_properties(
+            &mut final_analytics,
+            task_analytics_summary_from_events(&events),
+        );
+    }
+    product_analytics::capture_blocking(
+        store,
+        &format!("bu:{analytics_source} task {event_status}"),
+        final_analytics,
+    );
     store.finish_run(&run_id, run_status)?;
     drop(agent_span);
     telemetry.force_flush();
@@ -5134,6 +5283,79 @@ fn record_tool_artifact(
 mod tests {
     use super::*;
 
+    fn event(event_type: &str, payload: Value) -> EventRecord {
+        EventRecord {
+            seq: 0,
+            id: format!("event-{event_type}"),
+            session_id: "session-test".to_string(),
+            ts_ms: 0,
+            event_type: event_type.to_string(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn task_analytics_summary_rolls_up_usage_and_tool_names() {
+        let summary = task_analytics_summary_from_events(&[
+            event(
+                "model.usage",
+                json!({
+                    "input_tokens": 100,
+                    "input_cached_tokens": 40,
+                    "input_cache_creation_tokens": 10,
+                    "output_tokens": 25,
+                }),
+            ),
+            event(
+                "model.usage",
+                json!({
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 80,
+                }),
+            ),
+            event(
+                "model.tool_call",
+                json!({
+                    "id": "call-1",
+                    "name": "exec_command",
+                    "arguments": {"cmd": "secret command"},
+                }),
+            ),
+            event(
+                "model.tool_call",
+                json!({
+                    "id": "call-2",
+                    "name": "read_file",
+                    "arguments": {"path": "/private/file"},
+                }),
+            ),
+            event(
+                "model.tool_call",
+                json!({
+                    "id": "call-3",
+                    "name": "exec_command",
+                    "arguments": {"cmd": "another secret command"},
+                }),
+            ),
+        ]);
+
+        assert_eq!(summary["model_invocation_count"], 2);
+        assert_eq!(summary["input_tokens"], 150);
+        assert_eq!(summary["input_cached_tokens"], 40);
+        assert_eq!(summary["input_cache_creation_tokens"], 10);
+        assert_eq!(summary["output_tokens"], 35);
+        assert_eq!(summary["total_tokens"], 205);
+        assert_eq!(summary["tool_call_count"], 3);
+        assert_eq!(summary["unique_tool_count"], 2);
+        assert_eq!(summary["tool_names"], json!(["exec_command", "read_file"]));
+        assert_eq!(summary["tool_counts"]["exec_command"], 2);
+        assert_eq!(summary["tool_counts"]["read_file"], 1);
+        assert!(summary.to_string().contains("exec_command"));
+        assert!(!summary.to_string().contains("secret command"));
+        assert!(!summary.to_string().contains("/private/file"));
+    }
+
     #[test]
     fn browser_preference_commands_persist_mode_and_domain_profile() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -5956,10 +6178,7 @@ mod tests {
             AgentRunOptions {
                 max_turns: 4,
                 max_context_chars: 500,
-                browser_mode: None,
-                python_tool_timeout_seconds: 120,
-                python_env: Vec::new(),
-                child_agent_runner: None,
+                ..AgentRunOptions::default()
             },
         )?;
         let events = store.events_for_session(&session_id)?;
@@ -6371,10 +6590,7 @@ mod tests {
             AgentRunOptions {
                 max_turns: 2,
                 max_context_chars: 80_000,
-                browser_mode: None,
-                python_tool_timeout_seconds: 120,
-                python_env: Vec::new(),
-                child_agent_runner: None,
+                ..AgentRunOptions::default()
             },
         )?;
         let events = store.events_for_session(&session_id)?;

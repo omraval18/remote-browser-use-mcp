@@ -89,7 +89,8 @@ rg -n "/Users/|/home/|Developer/browser-harness|Downloads/tmp|hackathons|sk-|api
 - [ ] Confirm `config show` redacts stored secrets.
 - [ ] Confirm screenshots/GIFs do not show tokens, local usernames, private paths, or account ids.
 - [ ] Confirm logs, traces, artifacts, and terminal dumps are not committed.
-- [ ] Decide whether telemetry is opt-in, clearly documented, and fail-open.
+- [x] Decide and document telemetry policy.
+  Decision: anonymous product analytics are enabled by default, fail open, and can be disabled with `BUT_TELEMETRY=0`.
 - [ ] Document where local state is stored:
 
 ```text

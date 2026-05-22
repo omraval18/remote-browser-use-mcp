@@ -28,6 +28,8 @@ browser
 
 ## How It Works
 
+Browser Use Terminal is a browser-first LLM harness: Rust owns the agent loop and durable state, while the browser runtime gives the model direct CDP control over Chrome.
+
 ```text
 you
  │
@@ -42,6 +44,9 @@ browser terminal
       ▼
  real Chrome  |  headless Chromium  |  Browser Use cloud
 ```
+
+- The model gets raw browser capability: CDP, page JavaScript, screenshots, files, and helper code.
+- The terminal stays controllable: history, artifacts, follow-ups, browser recovery, and a custom Ratatui renderer for live work.
 
 ## Try It
 
@@ -92,6 +97,10 @@ scripts/verify-terminal-ui.sh
 ```
 
 Terminal UI changes must pass the full verification script. It runs Rust tests, Python tests, deterministic Ratatui dumps, and a real tmux smoke test.
+
+### Telemetry
+
+You can disable (100% completely anonymous) telemetry with  `BUT_TELEMETRY=0`.
 
 ## Docs
 

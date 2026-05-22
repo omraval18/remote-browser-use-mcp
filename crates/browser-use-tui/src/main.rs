@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::install_process_crypto_provider;
+use browser_use_core::{install_process_crypto_provider, product_analytics};
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
@@ -1672,12 +1672,27 @@ impl App {
 
     fn run_update(&mut self) -> Result<()> {
         self.status_notice = Some("Checking for browser-use terminal updates...".to_string());
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui update started",
+            serde_json::json!({ "surface": "tui" }),
+        );
         match run_update_installer() {
             Ok(message) => {
                 self.status_notice = Some(message);
+                product_analytics::capture_async(
+                    &self.store,
+                    "bu:tui update completed",
+                    serde_json::json!({ "surface": "tui" }),
+                );
             }
             Err(error) => {
                 self.status_notice = Some(format!("Update failed: {error:#}"));
+                product_analytics::capture_async(
+                    &self.store,
+                    "bu:tui update failed",
+                    serde_json::json!({ "surface": "tui" }),
+                );
             }
         }
         Ok(())
@@ -1724,6 +1739,7 @@ impl App {
         self.provider_model = choice.provider_model.to_string();
         self.agent_backend = choice.backend;
         self.model_configured = true;
+        self.track_model_selected();
         if self.account == ACCOUNT_CODEX {
             if let Err(error) = self.ensure_codex_auth_imported() {
                 self.pending_model_after_auth = Some(index);
@@ -1745,8 +1761,7 @@ impl App {
             if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
                 self.browser = BROWSER_LOCAL_CHROME.to_string();
             }
-            self.setup_complete = true;
-            self.store.set_setting("setup.complete", "1")?;
+            self.complete_setup()?;
             self.persist_runtime_settings()?;
             self.status_notice = None;
         } else {
@@ -1761,6 +1776,7 @@ impl App {
             .get(index.min(BROWSER_CHOICES.len().saturating_sub(1)))
             .unwrap_or(&BROWSER_CHOICES[0]);
         self.browser = (*choice).to_string();
+        self.track_browser_selected();
         self.persist_runtime_settings()?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
@@ -1771,8 +1787,7 @@ impl App {
         }
         self.status_notice = Some(format!("Browser set to {}.", self.browser));
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
-            self.setup_complete = true;
-            self.store.set_setting("setup.complete", "1")?;
+            self.complete_setup()?;
             self.close_surface();
         } else if !self.setup_complete {
             self.open_surface(Surface::Setup);
@@ -1800,8 +1815,7 @@ impl App {
             self.api_key_account = None;
             self.status_notice = Some("Saved Browser Use cloud key.".to_string());
             if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
-                self.setup_complete = true;
-                self.store.set_setting("setup.complete", "1")?;
+                self.complete_setup()?;
                 self.close_surface();
             } else {
                 self.close_surface();
@@ -1829,6 +1843,7 @@ impl App {
     }
 
     fn start_auth_flow(&mut self, account: String) -> Result<()> {
+        self.track_auth_provider_selected(&account);
         if account == ACCOUNT_CODEX {
             self.start_codex_auth(account)?;
             return Ok(());
@@ -2038,6 +2053,83 @@ impl App {
         )?;
         self.browser_notice = Some("Reconnect requested.".to_string());
         Ok(())
+    }
+
+    fn complete_setup(&mut self) -> Result<()> {
+        self.setup_complete = true;
+        self.store.set_setting("setup.complete", "1")?;
+        if cfg!(test) {
+            return Ok(());
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui setup completed",
+            serde_json::json!({
+                "surface": "tui",
+                "provider_kind": account_kind(&self.account),
+                "browser_kind": browser_choice_kind(&self.browser),
+            }),
+        );
+        Ok(())
+    }
+
+    fn track_app_opened(&self) {
+        if cfg!(test) {
+            return;
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui app opened",
+            serde_json::json!({
+                "surface": "tui",
+                "provider_kind": account_kind(&self.account),
+                "browser_kind": browser_choice_kind(&self.browser),
+                "setup_complete": self.setup_complete,
+            }),
+        );
+    }
+
+    fn track_model_selected(&self) {
+        if cfg!(test) {
+            return;
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui model selected",
+            serde_json::json!({
+                "surface": "tui",
+                "provider_kind": account_kind(&self.account),
+                "model": self.provider_model,
+            }),
+        );
+    }
+
+    fn track_browser_selected(&self) {
+        if cfg!(test) {
+            return;
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui browser selected",
+            serde_json::json!({
+                "surface": "tui",
+                "browser_kind": browser_choice_kind(&self.browser),
+            }),
+        );
+    }
+
+    fn track_auth_provider_selected(&self, account: &str) {
+        if cfg!(test) {
+            return;
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui auth provider selected",
+            serde_json::json!({
+                "surface": "tui",
+                "provider_kind": account_kind(account),
+            }),
+        );
     }
 
     fn persist_runtime_settings(&self) -> Result<()> {
@@ -2450,6 +2542,27 @@ fn auth_secret_label(account: &str) -> &'static str {
         BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
+    }
+}
+
+fn account_kind(account: &str) -> &'static str {
+    match account {
+        ACCOUNT_CODEX => "codex",
+        ACCOUNT_OPENAI => "openai",
+        ACCOUNT_OPENROUTER => "openrouter",
+        ACCOUNT_ANTHROPIC => "anthropic",
+        BROWSER_USE_CLOUD => "browser_use_cloud",
+        account if is_claude_code_account(account) => "claude_code",
+        _ => "unknown",
+    }
+}
+
+fn browser_choice_kind(browser: &str) -> &'static str {
+    match browser {
+        BROWSER_LOCAL_CHROME => "local",
+        "Headless Chromium" => "headless",
+        BROWSER_USE_CLOUD => "cloud",
+        _ => "other",
     }
 }
 
@@ -2888,6 +3001,7 @@ fn main() -> Result<()> {
         print_native_transcript(&mut app)?;
         return Ok(());
     }
+    app.track_app_opened();
     run_terminal(app)
 }
 

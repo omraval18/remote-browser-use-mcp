@@ -216,9 +216,11 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "portable-pty",
+ "reqwest 0.12.28",
  "rustls",
  "serde_json",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

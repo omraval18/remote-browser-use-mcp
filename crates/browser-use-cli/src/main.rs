@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
-    install_process_crypto_provider, record_python_response_final_event,
+    install_process_crypto_provider, product_analytics, record_python_response_final_event,
     record_python_worker_event, run_agent_from_config, run_existing_session_from_config,
     run_existing_session_with_provider, run_fake_agent, AgentRunOptions, FakeAgentOptions,
     ProviderBackend, ProviderRunConfig,
@@ -456,6 +456,11 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     args.state_dir = resolve_state_dir(&args.state_dir);
     let store = Store::open(&args.state_dir)?;
+    product_analytics::capture_async(
+        &store,
+        "bu:cli command ran",
+        serde_json::json!({ "command": command_name(&args.command), "surface": "cli" }),
+    );
     match args.command {
         Command::Start { text } => start(&store, text),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
@@ -509,7 +514,7 @@ fn main() -> Result<()> {
             release,
             check,
             install_script,
-        } => update(release, check, install_script),
+        } => update(&store, release, check, install_script),
         Command::DatasetList => dataset_list(),
         Command::DatasetSample {
             dataset,
@@ -685,6 +690,50 @@ fn main() -> Result<()> {
     }
 }
 
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Start { .. } => "start",
+        Command::RunFake { .. } => "run_fake",
+        Command::RunOpenai { .. } => "run_openai",
+        Command::RunCodex { .. } => "run_codex",
+        Command::RunAnthropic { .. } => "run_anthropic",
+        Command::RunOpenrouter { .. } => "run_openrouter",
+        Command::RunOpenaiSession { .. } => "run_openai_session",
+        Command::RunCodexSession { .. } => "run_codex_session",
+        Command::RunAnthropicSession { .. } => "run_anthropic_session",
+        Command::RunOpenrouterSession { .. } => "run_openrouter_session",
+        Command::Followup { .. } => "followup",
+        Command::Finish { .. } => "finish",
+        Command::Fail { .. } => "fail",
+        Command::Cancel { .. } => "cancel",
+        Command::Sessions { .. } => "sessions",
+        Command::History => "history",
+        Command::Show { .. } => "show",
+        Command::Events { .. } => "events",
+        Command::Python { .. } => "python",
+        Command::Export { .. } => "export",
+        Command::Import { .. } => "import",
+        Command::Config { .. } => "config",
+        Command::Auth { .. } => "auth",
+        Command::Diagnostics => "diagnostics",
+        Command::Trace { .. } => "trace",
+        Command::SpawnAgent { .. } => "spawn_agent",
+        Command::ListAgents { .. } => "list_agents",
+        Command::CloseAgent { .. } => "close_agent",
+        Command::SendAgentMessage { .. } => "send_agent_message",
+        Command::WaitAgent { .. } => "wait_agent",
+        Command::Update { .. } => "update",
+        Command::DatasetList => "dataset_list",
+        Command::DatasetSample { .. } => "dataset_sample",
+        Command::DatasetReport { .. } => "dataset_report",
+        Command::DatasetRunFake { .. } => "dataset_run_fake",
+        Command::DatasetRunOpenai { .. } => "dataset_run_openai",
+        Command::DatasetRunCodex { .. } => "dataset_run_codex",
+        Command::DatasetRunAnthropic { .. } => "dataset_run_anthropic",
+        Command::DatasetRunOpenrouter { .. } => "dataset_run_openrouter",
+    }
+}
+
 fn load_dotenv() -> Result<()> {
     let path = Path::new(".env");
     if !path.exists() {
@@ -726,7 +775,12 @@ fn unquote_env_value(value: &str) -> String {
 const DEFAULT_RELEASE_REPO: &str = "browser-use/terminal";
 const INSTALL_SCRIPT_BRANCH: &str = "main";
 
-fn update(release: String, check: bool, install_script: Option<String>) -> Result<()> {
+fn update(
+    store: &Store,
+    release: String,
+    check: bool,
+    install_script: Option<String>,
+) -> Result<()> {
     if check {
         let latest = if release == "latest" {
             latest_release_version()?
@@ -734,6 +788,20 @@ fn update(release: String, check: bool, install_script: Option<String>) -> Resul
             normalize_release_version(&release)
         };
         let current = env!("CARGO_PKG_VERSION");
+        let update_status = if latest == current {
+            "up_to_date"
+        } else {
+            "available"
+        };
+        product_analytics::capture_blocking(
+            store,
+            "bu:cli update checked",
+            serde_json::json!({
+                "surface": "cli",
+                "status": update_status,
+                "release": release.as_str(),
+            }),
+        );
         if latest == current {
             println!("browser-use terminal is up to date ({current}).");
         } else {
@@ -744,6 +812,11 @@ fn update(release: String, check: bool, install_script: Option<String>) -> Resul
     }
 
     let script = resolve_install_script(install_script)?;
+    product_analytics::capture_blocking(
+        store,
+        "bu:cli update started",
+        serde_json::json!({ "surface": "cli", "release": release.as_str() }),
+    );
     let status = std::process::Command::new("sh")
         .arg(&script)
         .arg("--release")
@@ -752,8 +825,18 @@ fn update(release: String, check: bool, install_script: Option<String>) -> Resul
         .status()
         .with_context(|| format!("run installer script {}", script.display()))?;
     if !status.success() {
+        product_analytics::capture_blocking(
+            store,
+            "bu:cli update failed",
+            serde_json::json!({ "surface": "cli", "release": release.as_str() }),
+        );
         bail!("installer exited with status {status}");
     }
+    product_analytics::capture_blocking(
+        store,
+        "bu:cli update completed",
+        serde_json::json!({ "surface": "cli", "release": release.as_str() }),
+    );
     Ok(())
 }
 
@@ -884,7 +967,9 @@ fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<
 }
 
 fn cli_agent_options() -> AgentRunOptions {
-    AgentRunOptions::default().with_browser_mode(cli_browser_mode())
+    AgentRunOptions::default()
+        .with_browser_mode(cli_browser_mode())
+        .with_analytics_source("cli")
 }
 
 fn cli_browser_mode() -> String {
@@ -2439,6 +2524,9 @@ fn run_dataset_case_with_provider<P: ModelProvider>(
         python_tool_timeout_seconds: config.python_timeout_seconds,
         python_env: dataset_python_env(run_id, case, attempt, &paths, &config),
         child_agent_runner: None,
+        analytics_source: Some("cli".to_string()),
+        analytics_provider_kind: Some(config.provider.clone()),
+        analytics_model: Some(config.model.clone()),
     };
     let run_error = run_existing_session_with_provider(store, provider, &session_id, agent_options)
         .err()
