@@ -493,6 +493,9 @@ install_release() {
     mkdir -p "$stage_release/python"
   fi
   chmod 0755 "$stage_release/bin/but" "$stage_release/bin/browser-use-terminal"
+  if [ -f "$stage_release/bin/browser-use-mcp" ]; then
+    chmod 0755 "$stage_release/bin/browser-use-mcp"
+  fi
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
     rm -rf "$release_dir"
@@ -508,6 +511,7 @@ release_dir_is_complete() {
   [ -d "$release_dir" ] &&
     [ -x "$release_dir/bin/but" ] &&
     [ -x "$release_dir/bin/browser-use-terminal" ] &&
+    [ -x "$release_dir/bin/browser-use-mcp" ] &&
     [ -f "$release_dir/python/llm_browser_worker/worker.py" ] &&
     [ "$(basename "$release_dir")" = "$expected_version-$expected_target" ]
 }
@@ -673,6 +677,9 @@ update_visible_commands() {
   write_hybrid_wrapper browser
   write_hybrid_wrapper browser-use
   write_hybrid_wrapper browser-use-terminal
+  if [ -x "$CURRENT_LINK/bin/browser-use-mcp" ]; then
+    write_launcher_wrapper browser-use-mcp browser-use-mcp
+  fi
 }
 
 verify_visible_command() (

@@ -59,6 +59,7 @@ pub enum ProviderBackend {
     Anthropic,
     Openrouter,
     Deepseek,
+    Ollama,
     Fake,
     None,
 }
@@ -329,6 +330,10 @@ pub fn run_existing_session_from_config(
             let provider = deepseek_provider(store, config.model)?;
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
+        ProviderBackend::Ollama => {
+            let provider = ollama_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
         ProviderBackend::Fake => {
             let provider = FakeProvider::with_text(
                 config
@@ -349,6 +354,7 @@ fn provider_backend_kind(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::Ollama => "ollama",
         ProviderBackend::Fake => "fake",
         ProviderBackend::None => "none",
     }
@@ -608,6 +614,23 @@ fn deepseek_provider(store: &Store, model: String) -> Result<OpenAICompatibleCha
     )?;
     Ok(OpenAICompatibleChatProvider::deepseek(
         api_key, model, base_url,
+    ))
+}
+
+fn ollama_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.ollama.base_url",
+        &["LLM_BROWSER_OLLAMA_BASE_URL", "OLLAMA_BASE_URL"],
+        "http://localhost:11434/v1",
+    )?;
+    // OLLAMA_MODEL env var overrides whatever is selected in the UI
+    let model = std::env::var("OLLAMA_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(model);
+    Ok(OpenAICompatibleChatProvider::with_base_url(
+        "ollama", model, base_url,
     ))
 }
 

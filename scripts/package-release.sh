@@ -34,10 +34,10 @@ if [[ -z "$TARGET_TRIPLE" ]]; then
 fi
 
 if [[ "$TARGET_TRIPLE_PROVIDED" -eq 1 || "$TARGET_TRIPLE" == *"-musl" ]]; then
-  cargo build --release --target "$TARGET_TRIPLE" -p browser-use-tui -p browser-use-cli
+  cargo build --release --target "$TARGET_TRIPLE" -p browser-use-tui -p browser-use-cli -p browser-use-mcp
   BUILD_DIR="$ROOT/target/$TARGET_TRIPLE/release"
 else
-  cargo build --release -p browser-use-tui -p browser-use-cli
+  cargo build --release -p browser-use-tui -p browser-use-cli -p browser-use-mcp
   BUILD_DIR="$ROOT/target/release"
 fi
 
@@ -47,12 +47,13 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/$PACKAGE_NAME/bin" "$STAGE/$PACKAGE_NAME/python"
 cp "$BUILD_DIR/but" "$STAGE/$PACKAGE_NAME/bin/but"
 cp "$BUILD_DIR/browser-use-terminal" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal"
+cp "$BUILD_DIR/browser-use-mcp" "$STAGE/$PACKAGE_NAME/bin/browser-use-mcp"
 ln -sf but "$STAGE/$PACKAGE_NAME/bin/browser"
 ln -sf but "$STAGE/$PACKAGE_NAME/bin/browser-use"
 cp -R "$ROOT/python/llm_browser_worker" "$STAGE/$PACKAGE_NAME/python/llm_browser_worker"
 find "$STAGE/$PACKAGE_NAME/python" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$STAGE/$PACKAGE_NAME/python" -type f -name '*.pyc' -delete
-chmod 0755 "$STAGE/$PACKAGE_NAME/bin/but" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal"
+chmod 0755 "$STAGE/$PACKAGE_NAME/bin/but" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal" "$STAGE/$PACKAGE_NAME/bin/browser-use-mcp"
 
 mkdir -p "$OUT_DIR"
 ARCHIVE="$OUT_DIR/$PACKAGE_NAME-$TARGET_TRIPLE.tar.gz"

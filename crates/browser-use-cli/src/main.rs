@@ -78,6 +78,11 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
+    RunOllama {
+        text: String,
+        #[arg(long, default_value = "llama3.2")]
+        model: String,
+    },
     RunOpenaiSession {
         task_id: String,
         #[arg(long, default_value = "gpt-5.5")]
@@ -101,6 +106,11 @@ enum Command {
     RunDeepseekSession {
         task_id: String,
         #[arg(long, default_value = "deepseek-v4-pro")]
+        model: String,
+    },
+    RunOllamaSession {
+        task_id: String,
+        #[arg(long, default_value = "llama3.2")]
         model: String,
     },
     Followup {
@@ -480,6 +490,7 @@ fn main() -> Result<()> {
         Command::RunAnthropic { text, model } => run_anthropic(&store, text, model),
         Command::RunOpenrouter { text, model } => run_openrouter(&store, text, model),
         Command::RunDeepseek { text, model } => run_deepseek(&store, text, model),
+        Command::RunOllama { text, model } => run_ollama(&store, text, model),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(&store, &task_id, model),
         Command::RunCodexSession { task_id, model } => run_codex_session(&store, &task_id, model),
         Command::RunAnthropicSession { task_id, model } => {
@@ -491,6 +502,7 @@ fn main() -> Result<()> {
         Command::RunDeepseekSession { task_id, model } => {
             run_deepseek_session(&store, &task_id, model)
         }
+        Command::RunOllamaSession { task_id, model } => run_ollama_session(&store, &task_id, model),
         Command::Followup { task_id, text } => followup(&store, &task_id, text),
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
         Command::Fail { task_id, error } => fail(&store, &task_id, error),
@@ -714,11 +726,13 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
+        Command::RunOllama { .. } => "run_ollama",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
+        Command::RunOllamaSession { .. } => "run_ollama_session",
         Command::Followup { .. } => "followup",
         Command::Finish { .. } => "finish",
         Command::Fail { .. } => "fail",
@@ -1052,6 +1066,23 @@ fn run_deepseek(store: &Store, text: String, model: String) -> Result<()> {
     let config =
         ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options());
     let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_ollama(store: &Store, text: String, model: String) -> Result<()> {
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Ollama, model).with_options(cli_agent_options());
+    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_ollama_session(store: &Store, task_id: &str, model: String) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Ollama, model).with_options(cli_agent_options());
+    let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }

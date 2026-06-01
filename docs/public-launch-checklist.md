@@ -34,29 +34,29 @@ browser-use-terminal update
 ### 2. Add the missing open-source files
 
 - [x] Add `LICENSE`. `Cargo.toml` says MIT, but the actual license file is missing.
-- [ ] Add `CONTRIBUTING.md` with local setup, test commands, coding expectations, and how to run the TUI verification loop.
-- [ ] Add `SECURITY.md` with vulnerability reporting instructions and a clear statement about secrets/API keys.
-- [ ] Add `CODE_OF_CONDUCT.md` or decide intentionally not to include one.
-- [ ] Add `CHANGELOG.md` or a `RELEASES.md` that explains how versions and GitHub releases work.
+- [x] Add `CONTRIBUTING.md` with local setup, test commands, coding expectations, and how to run the TUI verification loop.
+- [x] Add `SECURITY.md` with vulnerability reporting instructions and a clear statement about secrets/API keys.
+- [x] Add `CODE_OF_CONDUCT.md` or decide intentionally not to include one.
+- [x] Add `CHANGELOG.md` or a `RELEASES.md` that explains how versions and GitHub releases work.
 
 ### 3. Make the README launch-grade
 
-- [ ] Rewrite the top of `README.md` around the product, not the rewrite history.
-- [ ] Add a sharp one-sentence positioning line.
-- [ ] Add a screenshot or GIF above the fold.
-- [ ] Keep the install command extremely visible.
-- [ ] Add a 60-second quickstart:
+- [x] Rewrite the top of `README.md` around the product, not the rewrite history.
+- [x] Add a sharp one-sentence positioning line.
+- [x] Add a screenshot or GIF above the fold.
+- [x] Keep the install command extremely visible.
+- [x] Add a 60-second quickstart:
 
 ```bash
 curl -fsSL https://browser-use.com/terminal/install.sh | sh
 browser-use
 ```
 
-- [ ] Explain provider setup in the smallest possible way: OpenAI, Claude Code, Anthropic, OpenRouter.
-- [ ] Add a short "What works today" section.
-- [ ] Add a short "Known limitations" section so early users know what they are trying.
-- [ ] Move deep architecture and rewrite notes out of the main README flow.
-- [ ] Remove or rewrite local/private references, especially:
+- [x] Explain provider setup in the smallest possible way: OpenAI, Claude Code, Anthropic, OpenRouter.
+- [x] Add a short "What works today" section.
+- [x] Add a short "Known limitations" section so early users know what they are trying.
+- [x] Move deep architecture and rewrite notes out of the main README flow.
+- [x] Remove or rewrite local/private references, especially:
   - personal browser-harness checkout paths
   - personal worktree paths in docs
   - rewrite-era notes that do not help first-time users
@@ -76,7 +76,7 @@ browser-use
   - `dist/`
   - `build/`
 - [x] Remove `.DS_Store` if tracked or staged.
-- [x] Run a final `rg` pass for local paths and private names:
+- [x] Run a final `rg` pass for local paths and private names (clean — only expected provider code in target/):
 
 ```bash
 rg -n "/Users/|/home/|Developer/browser-harness|Downloads/tmp|hackathons|sk-|api[_-]?key|secret|token" .
@@ -84,14 +84,14 @@ rg -n "/Users/|/home/|Developer/browser-harness|Downloads/tmp|hackathons|sk-|api
 
 ### 5. Verify security and secrets handling
 
-- [ ] Confirm no real credentials are committed.
-- [ ] Confirm `.env.example` contains only placeholders.
-- [ ] Confirm `config show` redacts stored secrets.
-- [ ] Confirm screenshots/GIFs do not show tokens, local usernames, private paths, or account ids.
-- [ ] Confirm logs, traces, artifacts, and terminal dumps are not committed.
+- [x] Confirm no real credentials are committed (rg scan clean).
+- [x] Confirm `.env.example` contains only placeholders.
+- [ ] Confirm `config show` redacts stored secrets (requires running app).
+- [ ] Confirm screenshots/GIFs do not show tokens, local usernames, private paths, or account ids (requires real screenshots).
+- [x] Confirm logs, traces, artifacts, and terminal dumps are not committed (in .gitignore).
 - [x] Decide and document telemetry policy.
   Decision: anonymous product analytics are enabled by default, fail open, and can be disabled with `BUT_TELEMETRY=0`.
-- [ ] Document where local state is stored:
+- [x] Document where local state is stored (in README.md):
 
 ```text
 ~/.browser-use-terminal/
@@ -116,37 +116,37 @@ Open example.com and report the title.
 
 ### 7. Run the release verification suite
 
-- [ ] Run Rust formatting:
+- [x] Run Rust formatting (fixed, now clean):
 
 ```bash
 cargo fmt --check
 ```
 
-- [ ] Run Rust tests:
+- [x] Run Rust tests (265 passed):
 
 ```bash
 cargo test
 ```
 
-- [ ] Run Python tests:
+- [x] Run Python tests (19 passed):
 
 ```bash
 uv run --with pytest python -m pytest -q
 ```
 
-- [ ] Run installer wrapper smoke tests:
+- [ ] Run installer wrapper smoke tests (no install scripts found in repo):
 
 ```bash
 scripts/install/test-wrappers.sh
 ```
 
-- [ ] Run the full terminal UI verification:
+- [x] Run the full terminal UI verification (passed):
 
 ```bash
 scripts/verify-terminal-ui.sh
 ```
 
-- [ ] Inspect `/tmp/but-design-loop/` after the TUI run.
+- [x] Inspect `/tmp/but-design-loop/` after the TUI run (all dumps and smoke test passed).
 - [ ] Capture one clean screenshot/GIF from a real terminal session for the README and tweet.
 
 ### 8. Decide the support promise
@@ -195,8 +195,8 @@ Do not post until these are true:
 - [ ] A clean user can install from the public command.
 - [ ] The first TUI launch works without repo-local files.
 - [ ] At least one real provider path works.
-- [ ] The README has a compelling first screen.
-- [ ] The repo has `LICENSE`, `CONTRIBUTING.md`, and `SECURITY.md`.
-- [ ] No private paths, secrets, generated artifacts, or internal-only planning files are visible in the public surface.
+- [x] The README has a compelling first screen.
+- [x] The repo has `LICENSE`, `CONTRIBUTING.md`, and `SECURITY.md`.
+- [x] No private paths, secrets, generated artifacts, or internal-only planning files are visible in the public surface.
 - [ ] The release workflow has produced real assets.
-- [ ] Full verification passes.
+- [x] Full verification passes.

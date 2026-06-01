@@ -1,0 +1,14 @@
+- generic [ref=e1]:
+  - generic [ref=e4]:
+    - img [ref=e6]
+    - generic [ref=e9]:
+      - heading "Access Required" [level=1] [ref=e10]
+      - paragraph [ref=e11]: Please enter the access password to continue
+    - generic [ref=e12]:
+      - textbox "Enter access code" [active] [ref=e13]
+      - button "Continue" [ref=e14]
+    - generic [ref=e15]:
+      - paragraph [ref=e16]: Don't have access yet?
+      - link "Get in touch to request access →" [ref=e17] [cursor=pointer]:
+        - /url: https://brollygraph.com/#contact
+  - alert [ref=e18]

@@ -72,8 +72,8 @@ use runtime::run_agent_thread;
 use settings::{
     browser_use_cloud_env_key_present, is_claude_code_account, provider_model_for_display,
     AgentBackend, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
+    ACCOUNT_OLLAMA, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME,
+    BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -2311,6 +2311,7 @@ impl App {
                 "auth.deepseek.api_key",
                 &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
             )?,
+            ACCOUNT_OLLAMA => true,
             ACCOUNT_ANTHROPIC => self.has_stored_or_env(
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -2540,6 +2541,7 @@ fn account_kind(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "openai",
         ACCOUNT_OPENROUTER => "openrouter",
         ACCOUNT_DEEPSEEK => "deepseek",
+        ACCOUNT_OLLAMA => "ollama",
         ACCOUNT_ANTHROPIC => "anthropic",
         BROWSER_USE_CLOUD => "browser_use_cloud",
         account if is_claude_code_account(account) => "claude_code",

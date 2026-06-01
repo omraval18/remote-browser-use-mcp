@@ -1842,6 +1842,12 @@ fn model_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(model_row(idx, row_idx, app));
         row_idx += 1;
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("ollama (local)", muted())));
+    for &idx in VISIBLE_MODEL_CHOICES.iter().filter(|&&idx| idx >= 10) {
+        lines.push(model_row(idx, row_idx, app));
+        row_idx += 1;
+    }
     lines
 }
 
@@ -1889,6 +1895,7 @@ fn descriptor_for(idx: usize) -> &'static str {
         1 => "good browser agent",
         2 => "latest, strongest",
         7 => "vision + tools",
+        10.. => "local, no key",
         _ => "needs key",
     }
 }
