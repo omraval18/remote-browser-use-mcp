@@ -1,140 +1,28 @@
-use std::path::PathBuf;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+mod admin;
+mod auth;
+mod db;
+mod server;
 
-use anyhow::Result;
-use browser_use_browser::{cleanup_session, run_browser_command, run_browser_script};
-use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content},
-    tool, tool_handler, tool_router,
-    transport::stdio,
+use std::sync::Arc;
+
+use anyhow::{bail, Result};
+use axum::{
+    middleware,
+    routing::{delete, get, post},
+    Router,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use db::Db;
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
+use tokio_util::sync::CancellationToken;
 
-const SESSION_ID: &str = "mcp-session";
+use auth::{admin_auth_middleware, user_auth_middleware};
+use server::BrowserServer;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct BrowserCommandParams {
-    /// Browser control command, e.g. "connect local", "disconnect", "doctor", "profiles", "cloud start"
-    pub command: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct BrowserScriptParams {
-    /// Python code to execute. Uses pre-imported CDP helpers: goto_url, click_at_xy, type_text,
-    /// fill_input, screenshot, js, page_info, wait_for_load, wait_for_element, scroll, cdp, etc.
-    pub code: String,
-    /// Timeout in seconds (default: 60)
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
-}
-
-fn default_timeout() -> u64 {
-    60
-}
-
-#[derive(Clone)]
-pub struct BrowserServer {
-    cwd: PathBuf,
-    artifact_dir: PathBuf,
-    tool_router: ToolRouter<Self>,
-}
-
-impl BrowserServer {
-    fn new() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let artifact_dir = cwd.join(".browser-use").join("artifacts");
-        Self {
-            cwd,
-            artifact_dir,
-            tool_router: Self::tool_router(),
-        }
-    }
-}
-
-#[tool_router(router = tool_router)]
-impl BrowserServer {
-    #[tool(description = "Browser control plane: connect/disconnect/doctor/recover/profiles/cloud. Pass a command string like 'connect local', 'disconnect', 'doctor', 'profiles', 'cloud start'.")]
-    async fn browser(
-        &self,
-        params: Parameters<BrowserCommandParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let BrowserCommandParams { command } = params.0;
-        let cwd = self.cwd.clone();
-        let artifact_dir = self.artifact_dir.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            run_browser_command(SESSION_ID, &cwd, &artifact_dir, &command)
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let json = serde_json::json!({
-            "content": result.content,
-            "events": result.events,
-        });
-        Ok(CallToolResult::success(vec![Content::text(json.to_string())]))
-    }
-
-    #[tool(description = "Run Python browser interaction code. CDP helpers are pre-imported: goto_url, click_at_xy, type_text, fill_input, screenshot, js, page_info, wait_for_load, wait_for_element, scroll, cdp, etc. Call browser('connect local') first.")]
-    async fn browser_script(
-        &self,
-        params: Parameters<BrowserScriptParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let BrowserScriptParams { code, timeout_seconds } = params.0;
-        let cwd = self.cwd.clone();
-        let artifact_dir = self.artifact_dir.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            run_browser_script(SESSION_ID, &cwd, &artifact_dir, &code, timeout_seconds)
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let mut contents: Vec<Content> = Vec::new();
-
-        // Inline any screenshot images as base64 so clients don't need filesystem access
-        for img in &result.images {
-            if let Some(path) = img.get("path").and_then(|p| p.as_str()) {
-                if let Ok(bytes) = std::fs::read(path) {
-                    let b64 = BASE64.encode(&bytes);
-                    contents.push(Content::image(b64, "image/png"));
-                }
-            }
-        }
-
-        let json = serde_json::to_value(&result)
-            .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "serialization failed"}));
-        contents.push(Content::text(json.to_string()));
-
-        Ok(CallToolResult::success(contents))
-    }
-}
-
-#[tool_handler(
-    router = self.tool_router,
-    name = "browser-use-mcp",
-    instructions = "Browser automation server. Call browser('connect local') to attach to Chrome, then use browser_script to run Python CDP interaction code."
-)]
-impl ServerHandler for BrowserServer {}
-
-fn print_usage() {
-    eprintln!("Usage: browser-use-mcp [--http [--port <PORT>] [--host <HOST>]]");
-    eprintln!();
-    eprintln!("Modes:");
-    eprintln!("  (no flags)      stdio — for local MCP clients (Claude Desktop, Cursor, Claude Code)");
-    eprintln!("  --http          HTTP  — listens for remote MCP clients (VPS, shared server)");
-    eprintln!();
-    eprintln!("HTTP options:");
-    eprintln!("  --port <PORT>   Port to listen on (default: 3000)");
-    eprintln!("  --host <HOST>   Host to bind to (default: 0.0.0.0)");
-    eprintln!();
-    eprintln!("HTTP client config (Claude Desktop / Cursor):");
-    eprintln!("  {{ \"url\": \"http://<host>:<port>/mcp\" }}");
+pub struct AppState {
+    pub db: Arc<Db>,
+    pub admin_secret: String,
 }
 
 #[tokio::main]
@@ -147,56 +35,129 @@ async fn main() -> Result<()> {
     }
 
     if args.contains(&"--http".to_string()) {
-        use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-            session::local::LocalSessionManager,
-        };
-        use tokio_util::sync::CancellationToken;
-
-        let port: u16 = args
-            .iter()
-            .position(|a| a == "--port")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(3000);
-
-        let host = args
-            .iter()
-            .position(|a| a == "--host")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-            .unwrap_or("0.0.0.0")
-            .to_string();
-
-        let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
-
-        let ct = CancellationToken::new();
-        let config = StreamableHttpServerConfig::default()
-            .disable_allowed_hosts()
-            .with_cancellation_token(ct.child_token());
-
-        let service: StreamableHttpService<BrowserServer, LocalSessionManager> =
-            StreamableHttpService::new(|| Ok(BrowserServer::new()), Default::default(), config);
-
-        let router = axum::Router::new().nest_service("/mcp", service);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-
-        eprintln!("browser-use-mcp HTTP transport listening on http://{addr}/mcp");
-        eprintln!("Connect from MCP client: {{ \"url\": \"http://{addr}/mcp\" }}");
-
-        tokio::select! {
-            result = axum::serve(listener, router) => { result?; }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("Shutting down...");
-                ct.cancel();
-            }
-        }
+        run_http(&args).await
     } else {
-        let server = BrowserServer::new();
-        let service = server.serve(stdio()).await?;
-        service.waiting().await?;
-        cleanup_session(SESSION_ID);
+        server::run_stdio().await
+    }
+}
+
+async fn run_http(args: &[String]) -> Result<()> {
+    let port: u16 = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+
+    let host = args
+        .iter()
+        .position(|a| a == "--host")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+        .unwrap_or("0.0.0.0")
+        .to_string();
+
+    let admin_secret = std::env::var("ADMIN_SECRET").unwrap_or_default();
+    if admin_secret.trim().is_empty() {
+        bail!("ADMIN_SECRET env var is required in HTTP mode. Set a strong random secret.");
+    }
+
+    let db_path = std::env::var("BROWSER_USE_DB_PATH")
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{home}/.browser-use/mcp-users.db")
+        });
+
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(&db_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let db = Db::open(&db_path)?;
+    let state = Arc::new(AppState {
+        db,
+        admin_secret,
+    });
+
+    // MCP service: each new HTTP connection gets a fresh BrowserServer instance
+    // with its own UUID session. The auth middleware sets AUTHED_USER_ID via
+    // task-local so the factory can read the user identity and auto-connect
+    // the right Chrome profile.
+    let ct = CancellationToken::new();
+    let mcp_config = StreamableHttpServerConfig::default()
+        .disable_allowed_hosts()
+        .with_cancellation_token(ct.child_token());
+
+    let mcp_service: StreamableHttpService<BrowserServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(BrowserServer::new()), Default::default(), mcp_config);
+
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+
+    let app = Router::new()
+        // MCP endpoint — protected by user API key
+        .nest_service("/mcp", mcp_service)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            user_auth_middleware,
+        ))
+        // Admin REST API — protected by ADMIN_SECRET
+        .nest(
+            "/api",
+            Router::new()
+                .route("/users", post(admin::create_user))
+                .route("/users", get(admin::list_users))
+                .route("/users/{user_id}", delete(admin::revoke_user))
+                .route("/users/{user_id}/rotate-key", post(admin::rotate_key))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    admin_auth_middleware,
+                )),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    eprintln!("browser-use-mcp listening on http://{addr}");
+    eprintln!("  MCP endpoint : http://{addr}/mcp   (requires user API key)");
+    eprintln!("  Admin API    : http://{addr}/api/*  (requires ADMIN_SECRET)");
+    eprintln!("  Profiles dir : {}", server::profiles_base_dir().display());
+    eprintln!("  DB           : {}", std::env::var("BROWSER_USE_DB_PATH")
+        .unwrap_or_else(|_| "~/.browser-use/mcp-users.db".to_string()));
+
+    tokio::select! {
+        result = axum::serve(listener, app) => { result?; }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("Shutting down...");
+            ct.cancel();
+        }
     }
 
     Ok(())
+}
+
+fn print_usage() {
+    eprintln!("Usage: browser-use-mcp [--http [--port <PORT>] [--host <HOST>]]");
+    eprintln!();
+    eprintln!("Modes:");
+    eprintln!("  (no flags)      stdio — for local MCP clients (no auth)");
+    eprintln!("  --http          HTTP  — multi-user server with auth");
+    eprintln!();
+    eprintln!("Required env vars (HTTP mode):");
+    eprintln!("  ADMIN_SECRET=<strong-random-secret>   protects /api/* routes");
+    eprintln!();
+    eprintln!("Optional env vars:");
+    eprintln!("  BROWSER_USE_PROFILES_DIR=<path>       Chrome profiles base dir");
+    eprintln!("                                         (default: ~/.browser-use/profiles/)");
+    eprintln!("  BROWSER_USE_DB_PATH=<path>             SQLite DB path");
+    eprintln!("                                         (default: ~/.browser-use/mcp-users.db)");
+    eprintln!();
+    eprintln!("Admin API (all require: Authorization: Bearer $ADMIN_SECRET):");
+    eprintln!("  POST   /api/users                     Create user, returns api_key");
+    eprintln!("  GET    /api/users                     List all users + last_seen");
+    eprintln!("  DELETE /api/users/:user_id             Revoke access (keeps Chrome profile)");
+    eprintln!("  POST   /api/users/:user_id/rotate-key  Issue new key, invalidate old");
+    eprintln!();
+    eprintln!("MCP client config (requires user API key from POST /api/users):");
+    eprintln!("  {{ \"url\": \"http://<host>:<port>/mcp\",");
+    eprintln!("    \"headers\": {{ \"Authorization\": \"Bearer buak_...\" }} }}");
 }

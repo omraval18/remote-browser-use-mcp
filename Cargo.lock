@@ -284,11 +284,14 @@ dependencies = [
  "base64",
  "browser-use-browser",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
