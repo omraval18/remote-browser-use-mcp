@@ -63,16 +63,16 @@ fn subscribe_to_browser() -> broadcast::Receiver<Arc<Vec<u8>>> {
 async fn run_browser_screencast(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    // Page.startScreencast doesn't push frames in --headless=new Chrome.
-    // Instead: keep a persistent WS open and poll captureScreenshot as fast as
-    // Chrome responds — typically 30-100ms/frame → 10-30 fps, zero subprocess overhead.
+    eprintln!("[browser-stream] fetching CDP page WS URL...");
     let ws_url = cdp_page_ws_url(9222).await?;
+    eprintln!("[browser-stream] connecting to {ws_url}");
     let (ws, _) = connect_async(&ws_url).await?;
+    eprintln!("[browser-stream] connected, starting capture loop");
     let (mut write, mut read) = ws.split();
 
     let mut cmd_id: u64 = 1;
+    let mut frame_count: u64 = 0;
     loop {
-        // Send captureScreenshot
         write.send(Message::Text(serde_json::json!({
             "id": cmd_id,
             "method": "Page.captureScreenshot",
@@ -80,17 +80,21 @@ async fn run_browser_screencast(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow:
         }).to_string())).await?;
         cmd_id += 1;
 
-        // Read responses until we get the result for our command
         loop {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                    // Skip events, wait for the screenshot result
                     if v.get("id").is_some() {
                         if let Some(data) = v["result"]["data"].as_str() {
                             if let Ok(jpeg) = BASE64.decode(data) {
+                                frame_count += 1;
+                                if frame_count % 30 == 1 {
+                                    eprintln!("[browser-stream] frame {frame_count}, {} bytes", jpeg.len());
+                                }
                                 let _ = tx.send(Arc::new(jpeg));
                             }
+                        } else {
+                            eprintln!("[browser-stream] no data in result: {}", &text[..text.len().min(200)]);
                         }
                         break;
                     }
