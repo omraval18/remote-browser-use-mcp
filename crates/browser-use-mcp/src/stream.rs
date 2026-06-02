@@ -12,7 +12,7 @@ use axum::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
@@ -59,74 +59,61 @@ fn subscribe_to_browser() -> broadcast::Receiver<Arc<Vec<u8>>> {
     tx.subscribe()
 }
 
-/// GET /json/version → webSocketDebuggerUrl for the browser-level CDP endpoint.
-async fn cdp_browser_ws_url(port: u16) -> anyhow::Result<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    let mut s = TcpStream::connect(("localhost", port)).await?;
-    s.write_all(
-        format!("GET /json/version HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
-    )
-    .await?;
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await?;
-    let body = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .ok_or_else(|| anyhow::anyhow!("no HTTP body from /json/version"))?;
-    let v: serde_json::Value = serde_json::from_slice(&buf[body..])?;
-    v["webSocketDebuggerUrl"]
-        .as_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("Chrome not reachable at localhost:{port}"))
-}
 
 async fn run_browser_screencast(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow::Result<()> {
-    use chromiumoxide::Browser;
-    use chromiumoxide::cdp::browser_protocol::page::{
-        EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
-        StartScreencastParams,
-    };
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    let ws_url = cdp_browser_ws_url(9222).await?;
-    let (browser, mut handler) = Browser::connect(ws_url).await?;
+    // Use the PAGE-level WS URL (not browser-level) — directly attach and screencast.
+    let ws_url = cdp_page_ws_url(9222).await?;
+    let (ws, _) = connect_async(&ws_url).await?;
+    let (mut write, mut read) = ws.split();
 
-    // Handler must be polled continuously — it drives the underlying CDP connection.
-    tokio::spawn(async move { while handler.next().await.is_some() {} });
+    write.send(Message::Text(serde_json::json!({
+        "id": 1, "method": "Page.startScreencast",
+        "params": { "format": "jpeg", "quality": 80,
+                    "maxWidth": 1920, "maxHeight": 1080, "everyNthFrame": 1 }
+    }).to_string())).await?;
 
-    let pages = browser.pages().await?;
-    let page = pages
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no browser pages open"))?;
-
-    page.execute(
-        StartScreencastParams::builder()
-            .format(StartScreencastFormat::Jpeg)
-            .quality(80i64)
-            .max_width(1920i64)
-            .max_height(1080i64)
-            .every_nth_frame(1i64)
-            .build(),
-    )
-    .await?;
-
-    let mut frames = page.event_listener::<EventScreencastFrame>().await?;
-    while let Some(event) = frames.next().await {
-        // Binary is a base64-encoded newtype — decode to raw JPEG.
-        if let Ok(jpeg) = BASE64.decode(event.data.as_ref() as &str) {
-            let _ = tx.send(Arc::new(jpeg));
+    let mut cmd_id: u64 = 2;
+    while let Some(msg) = read.next().await {
+        if let Message::Text(text) = msg? {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if v["method"] == "Page.screencastFrame" {
+                let data = v["params"]["data"].as_str().unwrap_or("");
+                let session_id = v["params"]["sessionId"].as_u64().unwrap_or(0);
+                if let Ok(jpeg) = BASE64.decode(data) {
+                    let _ = tx.send(Arc::new(jpeg));
+                }
+                write.send(Message::Text(serde_json::json!({
+                    "id": cmd_id, "method": "Page.screencastFrameAck",
+                    "params": { "sessionId": session_id }
+                }).to_string())).await?;
+                cmd_id += 1;
+            }
         }
-        // Chrome stops sending frames if we don't ACK every one.
-        let _ = page
-            .execute(ScreencastFrameAckParams::new(event.session_id))
-            .await;
     }
-
     Ok(())
+}
+
+/// GET /json → page-level WebSocket URL for the first open page tab.
+async fn cdp_page_ws_url(port: u16) -> anyhow::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let mut s = TcpStream::connect(("localhost", port)).await?;
+    s.write_all(
+        format!("GET /json HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    ).await?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await?;
+    let body = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+        .ok_or_else(|| anyhow::anyhow!("no HTTP body from /json"))?;
+    let tabs: Vec<serde_json::Value> = serde_json::from_slice(&buf[body..])?;
+    tabs.iter()
+        .find(|t| t["type"] == "page")
+        .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("no page tab in Chrome CDP"))
 }
 
 // ---------------------------------------------------------------------------
