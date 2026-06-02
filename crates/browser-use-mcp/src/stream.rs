@@ -63,36 +63,44 @@ fn subscribe_to_browser() -> broadcast::Receiver<Arc<Vec<u8>>> {
 async fn run_browser_screencast(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    // Use the PAGE-level WS URL (not browser-level) — directly attach and screencast.
+    // Page.startScreencast doesn't push frames in --headless=new Chrome.
+    // Instead: keep a persistent WS open and poll captureScreenshot as fast as
+    // Chrome responds — typically 30-100ms/frame → 10-30 fps, zero subprocess overhead.
     let ws_url = cdp_page_ws_url(9222).await?;
     let (ws, _) = connect_async(&ws_url).await?;
     let (mut write, mut read) = ws.split();
 
-    write.send(Message::Text(serde_json::json!({
-        "id": 1, "method": "Page.startScreencast",
-        "params": { "format": "jpeg", "quality": 80,
-                    "maxWidth": 1920, "maxHeight": 1080, "everyNthFrame": 1 }
-    }).to_string())).await?;
+    let mut cmd_id: u64 = 1;
+    loop {
+        // Send captureScreenshot
+        write.send(Message::Text(serde_json::json!({
+            "id": cmd_id,
+            "method": "Page.captureScreenshot",
+            "params": { "format": "jpeg", "quality": 80 }
+        }).to_string())).await?;
+        cmd_id += 1;
 
-    let mut cmd_id: u64 = 2;
-    while let Some(msg) = read.next().await {
-        if let Message::Text(text) = msg? {
-            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            if v["method"] == "Page.screencastFrame" {
-                let data = v["params"]["data"].as_str().unwrap_or("");
-                let session_id = v["params"]["sessionId"].as_u64().unwrap_or(0);
-                if let Ok(jpeg) = BASE64.decode(data) {
-                    let _ = tx.send(Arc::new(jpeg));
+        // Read responses until we get the result for our command
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                    // Skip events, wait for the screenshot result
+                    if v.get("id").is_some() {
+                        if let Some(data) = v["result"]["data"].as_str() {
+                            if let Ok(jpeg) = BASE64.decode(data) {
+                                let _ = tx.send(Arc::new(jpeg));
+                            }
+                        }
+                        break;
+                    }
                 }
-                write.send(Message::Text(serde_json::json!({
-                    "id": cmd_id, "method": "Page.screencastFrameAck",
-                    "params": { "sessionId": session_id }
-                }).to_string())).await?;
-                cmd_id += 1;
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(()),
             }
         }
     }
-    Ok(())
 }
 
 /// GET /json → page-level WebSocket URL for the first open page tab.
