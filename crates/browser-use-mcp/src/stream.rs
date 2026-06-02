@@ -1,6 +1,6 @@
 use std::convert::Infallible;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{
@@ -12,13 +12,14 @@ use axum::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use browser_use_browser::{run_browser_command, run_browser_script};
+use futures_util::StreamExt;
 use serde::Deserialize;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::AppState;
 use crate::auth::bearer_from_headers;
-use crate::server::{active_sessions, profiles_base_dir};
+use crate::server::active_sessions;
 
 #[derive(Deserialize)]
 pub struct KeyQuery {
@@ -32,99 +33,304 @@ fn admin_check(state: &AppState, headers: &HeaderMap, key: Option<&str>) -> bool
     token.map(|t| t == state.admin_secret).unwrap_or(false)
 }
 
-// --- JPEG frame capture ---
+// ---------------------------------------------------------------------------
+// Browser-tab stream — chromiumoxide → CDP Page.startScreencast → JPEG
+// ---------------------------------------------------------------------------
+// chromiumoxide provides a typed, async CDP client. Chrome pushes JPEG frames
+// via Page.screencastFrame events; we ACK each one and broadcast the bytes.
 
-async fn capture_jpeg(session_id: String) -> anyhow::Result<Vec<u8>> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let artifact_dir = cwd.join(".browser-use").join("artifacts");
-    tokio::task::spawn_blocking(move || {
-        // Auto-connect to local Chrome if this session has no browser yet.
-        // run_browser_command is idempotent — if already connected it's a no-op.
-        let _ = run_browser_command(&session_id, &cwd, &artifact_dir, "connect local");
+static BROWSER_TX: OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = OnceLock::new();
+static BROWSER_STARTED: AtomicBool = AtomicBool::new(false);
 
-        let code = r#"
-result = cdp("Page.captureScreenshot", format="jpeg", quality=55)
-print(result["data"], end="")
-"#;
-        let out = run_browser_script(&session_id, &cwd, &artifact_dir, code, 10)?;
-        if !out.ok {
-            return Err(anyhow::anyhow!(
-                "screenshot failed: {}",
-                out.error.unwrap_or_default()
-            ));
-        }
-        let b64 = out.text.trim();
-        if b64.is_empty() {
-            return Err(anyhow::anyhow!("empty screenshot response"));
-        }
-        Ok(BASE64.decode(b64)?)
-    })
-    .await?
-}
-
-// --- Session lookup ---
-
-fn session_id_for_user(user_id: &str) -> Option<String> {
-    // In HTTP mode the session_id is keyed by user_id, so they're identical.
-    // Confirm the session is actually registered before returning.
-    let sessions = active_sessions().lock().ok()?;
-    if sessions.contains_key(user_id) {
-        Some(user_id.to_string())
-    } else {
-        // Fallback: scan for a session whose user_id field matches
-        sessions
-            .values()
-            .find(|m| m.user_id.as_deref() == Some(user_id))
-            .map(|m| m.session_id.clone())
+fn subscribe_to_browser() -> broadcast::Receiver<Arc<Vec<u8>>> {
+    let tx = BROWSER_TX.get_or_init(|| broadcast::channel(32).0);
+    if !BROWSER_STARTED.swap(true, Ordering::AcqRel) {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = run_browser_screencast(&tx2).await {
+                    eprintln!("[browser-stream] {e}");
+                }
+                BROWSER_STARTED.store(false, Ordering::Release);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
     }
+    tx.subscribe()
 }
 
-// --- SSE stream route ---
+/// GET /json/version → webSocketDebuggerUrl for the browser-level CDP endpoint.
+async fn cdp_browser_ws_url(port: u16) -> anyhow::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut s = TcpStream::connect(("localhost", port)).await?;
+    s.write_all(
+        format!("GET /json/version HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await?;
+    let body = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .ok_or_else(|| anyhow::anyhow!("no HTTP body from /json/version"))?;
+    let v: serde_json::Value = serde_json::from_slice(&buf[body..])?;
+    v["webSocketDebuggerUrl"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Chrome not reachable at localhost:{port}"))
+}
+
+async fn run_browser_screencast(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow::Result<()> {
+    use chromiumoxide::Browser;
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
+        StartScreencastParams,
+    };
+
+    let ws_url = cdp_browser_ws_url(9222).await?;
+    let (browser, mut handler) = Browser::connect(ws_url).await?;
+
+    // Handler must be polled continuously — it drives the underlying CDP connection.
+    tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let pages = browser.pages().await?;
+    let page = pages
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no browser pages open"))?;
+
+    page.execute(
+        StartScreencastParams::builder()
+            .format(StartScreencastFormat::Jpeg)
+            .quality(80i64)
+            .max_width(1920i64)
+            .max_height(1080i64)
+            .every_nth_frame(1i64)
+            .build(),
+    )
+    .await?;
+
+    let mut frames = page.event_listener::<EventScreencastFrame>().await?;
+    while let Some(event) = frames.next().await {
+        // Binary is a base64-encoded newtype — decode to raw JPEG.
+        if let Ok(jpeg) = BASE64.decode(event.data.as_ref() as &str) {
+            let _ = tx.send(Arc::new(jpeg));
+        }
+        // Chrome stops sending frames if we don't ACK every one.
+        let _ = page
+            .execute(ScreencastFrameAckParams::new(event.session_id))
+            .await;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Desktop stream — ffmpeg MJPEG pipe → parsed JPEG frames → SSE
+// ---------------------------------------------------------------------------
+// ffmpeg captures the full display via AVFoundation (macOS) / x11grab (Linux)
+// and outputs MJPEG frames back-to-back to stdout. We split the raw stream on
+// JPEG SOI/EOI boundaries to extract individual frames.
+
+static DESKTOP_TX: OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = OnceLock::new();
+static DESKTOP_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn subscribe_to_desktop() -> broadcast::Receiver<Arc<Vec<u8>>> {
+    let tx = DESKTOP_TX.get_or_init(|| broadcast::channel(16).0);
+    if !DESKTOP_STARTED.swap(true, Ordering::AcqRel) {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = run_ffmpeg_desktop(&tx2).await {
+                    eprintln!("[desktop-stream] {e}");
+                }
+                DESKTOP_STARTED.store(false, Ordering::Release);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+    }
+    tx.subscribe()
+}
+
+/// Detect the AVFoundation video device index for the main screen.
+/// Runs `ffmpeg -list_devices` and finds the first "Capture screen" entry.
+#[cfg(target_os = "macos")]
+async fn avf_screen_device() -> String {
+    let Ok(out) = tokio::process::Command::new("ffmpeg")
+        .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .output()
+        .await
+    else {
+        return "1".to_owned();
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stderr.lines() {
+        if line.contains("Capture screen") {
+            // Lines look like: "[AVFoundation indev @ ...] [1] Capture screen 0"
+            if let Some(start) = line.rfind('[') {
+                let rest = &line[start + 1..];
+                if let Some(end) = rest.find(']') {
+                    let idx = rest[..end].trim().to_owned();
+                    if idx.parse::<u32>().is_ok() {
+                        return idx;
+                    }
+                }
+            }
+        }
+    }
+    "1".to_owned()
+}
+
+async fn run_ffmpeg_desktop(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    #[cfg(target_os = "macos")]
+    let (input_args, fps) = {
+        let dev = avf_screen_device().await;
+        let dev: &'static str = Box::leak(dev.into_boxed_str());
+        (
+            vec!["-f", "avfoundation", "-capture_cursor", "1", "-framerate", "15", "-i", dev],
+            "15",
+        )
+    };
+
+    #[cfg(target_os = "linux")]
+    let (input_args, fps) = (
+        vec!["-f", "x11grab", "-framerate", "15", "-i", ":0.0"],
+        "15",
+    );
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(anyhow::anyhow!("desktop capture not supported on this platform"));
+
+    let _ = fps; // used above for documentation clarity
+    let mut child = Command::new("ffmpeg")
+        .args(&input_args)
+        .args([
+            "-vf", "scale=1280:-2",
+            "-c:v", "mjpeg",
+            "-q:v", "4",        // 1=best, 31=worst; 4 ≈ 85% JPEG quality
+            "-f", "image2pipe",
+            "pipe:1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20); // 1 MB initial
+    let mut chunk = vec![0u8; 65_536];
+
+    loop {
+        let n = stdout.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        // Drain complete JPEG frames from the front of buf.
+        // A frame starts at the first SOI (0xFF 0xD8) and ends just before
+        // the next SOI — ffmpeg outputs valid, back-to-back JPEG frames.
+        loop {
+            // Trim leading bytes before the first SOI.
+            let first_soi = buf.windows(2).position(|w| w == [0xFF, 0xD8]);
+            let first_soi = match first_soi {
+                Some(p) => p,
+                None => {
+                    buf.clear();
+                    break;
+                }
+            };
+            if first_soi > 0 {
+                buf.drain(..first_soi);
+            }
+            // A second SOI marks the start of the next frame = end of current frame.
+            let second_soi = buf[2..].windows(2).position(|w| w == [0xFF, 0xD8]);
+            match second_soi {
+                None => break, // current frame not yet complete — wait for more data
+                Some(offset) => {
+                    let frame_end = offset + 2;
+                    let jpeg: Vec<u8> = buf.drain(..frame_end).collect();
+                    let _ = tx.send(Arc::new(jpeg));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared: wrap a broadcast receiver as an SSE stream of base64-JPEG events
+// ---------------------------------------------------------------------------
+
+fn sse_from_jpeg_broadcast(
+    mut rx: broadcast::Receiver<Arc<Vec<u8>>>,
+) -> impl axum::response::IntoResponse {
+    let (tx, stream_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(8);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(jpeg) => {
+                    if tx
+                        .send(Ok(Event::default().data(BASE64.encode(&*jpeg))))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(stream_rx)).keep_alive(KeepAlive::default())
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /stream/{user_id}  — browser tab stream
+// ---------------------------------------------------------------------------
 
 pub async fn stream_sse(
     State(state): State<Arc<AppState>>,
-    Path(user_id): Path<String>,
+    Path(_user_id): Path<String>,
     Query(q): Query<KeyQuery>,
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, &'static str)> {
     if !admin_check(&state, &headers, q.key.as_deref()) {
         return Err((StatusCode::UNAUTHORIZED, "admin auth required"));
     }
-
-    // Fall back to user_id as session key — browser crate will auto-connect local Chrome
-    let session_id = session_id_for_user(&user_id).unwrap_or_else(|| user_id.clone());
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
-
-    tokio::spawn(async move {
-        loop {
-            match capture_jpeg(session_id.clone()).await {
-                Ok(jpeg) => {
-                    let b64 = BASE64.encode(&jpeg);
-                    if tx.send(Ok(Event::default().data(b64))).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("capture_error: {e}");
-                    if tx
-                        .send(Ok(Event::default().event("error").data(msg)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(800)).await;
-        }
-    });
-
-    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+    Ok(sse_from_jpeg_broadcast(subscribe_to_browser()))
 }
 
-// --- HTML viewer route ---
+// ---------------------------------------------------------------------------
+// Route: GET /desktop/{user_id}  — full desktop stream
+// ---------------------------------------------------------------------------
+
+pub async fn stream_desktop(
+    State(state): State<Arc<AppState>>,
+    Path(_user_id): Path<String>,
+    Query(q): Query<KeyQuery>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, &'static str)> {
+    if !admin_check(&state, &headers, q.key.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "admin auth required"));
+    }
+    Ok(sse_from_jpeg_broadcast(subscribe_to_desktop()))
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /view/{user_id}  — HTML viewer with Browser Tab / Desktop tabs
+// ---------------------------------------------------------------------------
 
 pub async fn stream_viewer(
     State(state): State<Arc<AppState>>,
@@ -136,21 +342,15 @@ pub async fn stream_viewer(
         return Err((StatusCode::UNAUTHORIZED, "admin auth required"));
     }
 
-    let profiles_dir = profiles_base_dir();
     let session_info = {
         let sessions = active_sessions().lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(&user_id).cloned()
     };
-
     let status = if session_info.is_some() {
-        format!("Active session for <strong>{user_id}</strong>")
+        format!("Active session: <strong>{user_id}</strong>")
     } else {
-        format!("Auto-connecting Chrome for <strong>{user_id}</strong>…")
+        format!("Waiting for session: <strong>{user_id}</strong>")
     };
-
-    let profile_path = session_info
-        .and_then(|s| s.profile_path)
-        .unwrap_or_else(|| profiles_dir.join(&user_id).to_string_lossy().to_string());
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -161,74 +361,118 @@ pub async fn stream_viewer(
 <title>Browser View — {user_id}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: #0d0d0d; color: #e0e0e0; font-family: system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }}
-  header {{ padding: 10px 16px; background: #1a1a1a; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }}
-  header h1 {{ font-size: 14px; font-weight: 600; }}
-  #status-dot {{ width: 10px; height: 10px; border-radius: 50%; background: #555; flex-shrink: 0; }}
-  #status-dot.live {{ background: #4ade80; box-shadow: 0 0 6px #4ade80; }}
-  #status-dot.error {{ background: #f87171; }}
-  #info {{ font-size: 12px; color: #888; margin-left: auto; }}
-  #fps-counter {{ font-size: 12px; color: #60a5fa; }}
-  main {{ flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 8px; }}
-  #frame {{ max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; border: 1px solid #333; }}
-  #placeholder {{ color: #555; font-size: 14px; text-align: center; line-height: 1.6; }}
-  footer {{ padding: 8px 16px; background: #1a1a1a; border-top: 1px solid #333; font-size: 11px; color: #555; }}
+  body {{ background: #0d0d0d; color: #e0e0e0; font-family: system-ui, sans-serif;
+         display: flex; flex-direction: column; height: 100vh; }}
+  header {{ padding: 8px 14px; background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
+            display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
+  h1 {{ font-size: 13px; font-weight: 600; white-space: nowrap; }}
+  .tabs {{ display: flex; gap: 2px; background: #111; border-radius: 6px; padding: 2px; }}
+  .tab {{ padding: 3px 11px; font-size: 12px; border-radius: 4px; cursor: pointer;
+          color: #777; border: none; background: none; }}
+  .tab.active {{ background: #2d2d2d; color: #e0e0e0; }}
+  #dot {{ width: 8px; height: 8px; border-radius: 50%; background: #444;
+          flex-shrink: 0; margin-left: auto; transition: background .3s; }}
+  #dot.live {{ background: #4ade80; box-shadow: 0 0 5px #4ade80; }}
+  #dot.err  {{ background: #f87171; }}
+  #fps  {{ font-size: 12px; color: #60a5fa; font-variant-numeric: tabular-nums; min-width: 48px; text-align: right; }}
+  #info {{ font-size: 11px; color: #555; white-space: nowrap; overflow: hidden;
+           text-overflow: ellipsis; max-width: 30%; }}
+  main  {{ flex: 1; display: flex; align-items: center; justify-content: center;
+           overflow: hidden; padding: 8px; }}
+  canvas {{ max-width: 100%; max-height: 100%; object-fit: contain;
+            border-radius: 4px; border: 1px solid #222; display: none; }}
+  #ph   {{ color: #444; font-size: 13px; text-align: center; line-height: 1.8; }}
 </style>
 </head>
 <body>
 <header>
-  <div id="status-dot"></div>
   <h1>browser-use &mdash; {user_id}</h1>
-  <span id="fps-counter"></span>
-  <span id="info">{status} &nbsp;|&nbsp; profile: <code>{profile_path}</code></span>
+  <div class="tabs">
+    <button class="tab active" data-src="/stream/{user_id}">Browser Tab</button>
+    <button class="tab"        data-src="/desktop/{user_id}">Desktop</button>
+  </div>
+  <div id="dot"></div>
+  <div id="fps"></div>
+  <div id="info">{status}</div>
 </header>
 <main>
-  <img id="frame" alt="waiting for first frame..." style="display:none">
-  <div id="placeholder">Waiting for browser session&hellip;<br><small>The AI needs to connect a browser before frames appear.</small></div>
+  <canvas id="cv"></canvas>
+  <div id="ph">Connecting…</div>
 </main>
-<footer>Stream: <code>/stream/{user_id}</code> &nbsp;&bull;&nbsp; ~1 fps JPEG via SSE &nbsp;&bull;&nbsp; read-only view</footer>
 <script>
 (function() {{
-  const img = document.getElementById('frame');
-  const placeholder = document.getElementById('placeholder');
-  const dot = document.getElementById('status-dot');
-  const fpsEl = document.getElementById('fps-counter');
-  let frameCount = 0, lastFpsTime = Date.now();
+  const cv  = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const ph  = document.getElementById('ph');
+  const dot = document.getElementById('dot');
+  const fpsEl = document.getElementById('fps');
 
-  const src = '/stream/{user_id}';
-  const qs = new URLSearchParams(window.location.search);
+  const qs  = new URLSearchParams(window.location.search);
   const key = qs.get('key') || '';
-  const url = key ? src + '?key=' + encodeURIComponent(key) : src;
+  const auth = key ? '?key=' + encodeURIComponent(key) : '';
 
-  const es = new EventSource(url);
+  let es = null, pending = null, rafPending = false;
+  let fc = 0, lastT = performance.now();
 
-  es.onmessage = function(e) {{
-    img.src = 'data:image/jpeg;base64,' + e.data;
-    img.style.display = '';
-    placeholder.style.display = 'none';
-    dot.className = 'live';
-    frameCount++;
-    const now = Date.now();
-    if (now - lastFpsTime >= 2000) {{
-      const fps = (frameCount / ((now - lastFpsTime) / 1000)).toFixed(1);
-      fpsEl.textContent = fps + ' fps';
-      frameCount = 0; lastFpsTime = now;
+  function renderFrame() {{
+    rafPending = false;
+    if (!pending) return;
+    const bm = pending; pending = null;
+    if (cv.width !== bm.width || cv.height !== bm.height) {{
+      cv.width = bm.width; cv.height = bm.height;
     }}
-  }};
+    ctx.drawImage(bm, 0, 0); bm.close();
+    fc++;
+    const now = performance.now();
+    if (now - lastT >= 1000) {{
+      fpsEl.textContent = (fc / ((now - lastT) / 1000)).toFixed(0) + ' fps';
+      fc = 0; lastT = now;
+    }}
+  }}
 
-  es.addEventListener('error', function(e) {{
-    dot.className = 'error';
+  function connect(src) {{
+    if (es) {{ es.close(); es = null; }}
+    if (pending) {{ pending.close(); pending = null; }}
+    dot.className = ''; fpsEl.textContent = '';
+    cv.style.display = 'none'; ph.style.display = '';
+    ph.textContent = 'Connecting…';
+
+    es = new EventSource(src + auth);
+
+    es.onmessage = function(e) {{
+      const raw = atob(e.data);
+      const buf = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+      createImageBitmap(new Blob([buf], {{ type: 'image/jpeg' }})).then(function(bm) {{
+        cv.style.display = ''; ph.style.display = 'none';
+        dot.className = 'live';
+        if (pending) pending.close();
+        pending = bm;
+        if (!rafPending) {{ rafPending = true; requestAnimationFrame(renderFrame); }}
+      }});
+    }};
+
+    es.onerror = function() {{
+      dot.className = 'err';
+      fpsEl.textContent = '';
+      ph.style.display = '';
+      ph.textContent = 'Reconnecting…';
+    }};
+  }}
+
+  document.querySelectorAll('.tab').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{
+      document.querySelectorAll('.tab').forEach(function(b) {{ b.classList.remove('active'); }});
+      btn.classList.add('active');
+      connect(btn.dataset.src);
+    }});
   }});
 
-  es.onerror = function() {{
-    dot.className = 'error';
-    fpsEl.textContent = 'reconnecting…';
-  }};
+  connect('/stream/{user_id}');
 }})();
 </script>
 </body>
 </html>"#
     );
-
     Ok(Html(html))
 }

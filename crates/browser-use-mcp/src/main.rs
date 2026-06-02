@@ -117,6 +117,7 @@ async fn run_http(args: &[String]) -> Result<()> {
         // Browser live-view — admin auth via Bearer header or ?key= query param
         .route("/view/{user_id}", get(stream::stream_viewer))
         .route("/stream/{user_id}", get(stream::stream_sse))
+        .route("/desktop/{user_id}", get(stream::stream_desktop))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
