@@ -12,7 +12,7 @@ use axum::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use browser_use_browser::run_browser_script;
+use browser_use_browser::{run_browser_command, run_browser_script};
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -38,6 +38,10 @@ async fn capture_jpeg(session_id: String) -> anyhow::Result<Vec<u8>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let artifact_dir = cwd.join(".browser-use").join("artifacts");
     tokio::task::spawn_blocking(move || {
+        // Auto-connect to local Chrome if this session has no browser yet.
+        // run_browser_command is idempotent — if already connected it's a no-op.
+        let _ = run_browser_command(&session_id, &cwd, &artifact_dir, "connect local");
+
         let code = r#"
 result = cdp("Page.captureScreenshot", format="jpeg", quality=55)
 print(result["data"], end="")
@@ -87,10 +91,8 @@ pub async fn stream_sse(
         return Err((StatusCode::UNAUTHORIZED, "admin auth required"));
     }
 
-    let session_id = session_id_for_user(&user_id).ok_or((
-        StatusCode::NOT_FOUND,
-        "no active session for this user — have the AI connect a browser first",
-    ))?;
+    // Fall back to user_id as session key — browser crate will auto-connect local Chrome
+    let session_id = session_id_for_user(&user_id).unwrap_or_else(|| user_id.clone());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
 
@@ -143,10 +145,7 @@ pub async fn stream_viewer(
     let status = if session_info.is_some() {
         format!("Active session for <strong>{user_id}</strong>")
     } else {
-        format!(
-            "No active session for <strong>{user_id}</strong> — \
-             the AI needs to run <code>browser connect local</code> first."
-        )
+        format!("Auto-connecting Chrome for <strong>{user_id}</strong>…")
     };
 
     let profile_path = session_info
