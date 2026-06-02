@@ -2,6 +2,7 @@ mod admin;
 mod auth;
 mod db;
 mod server;
+mod stream;
 
 use std::sync::Arc;
 
@@ -113,13 +114,17 @@ async fn run_http(args: &[String]) -> Result<()> {
                     admin_auth_middleware,
                 )),
         )
+        // Browser live-view — admin auth via Bearer header or ?key= query param
+        .route("/view/{user_id}", get(stream::stream_viewer))
+        .route("/stream/{user_id}", get(stream::stream_sse))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     eprintln!("browser-use-mcp listening on http://{addr}");
-    eprintln!("  MCP endpoint : http://{addr}/mcp   (requires user API key)");
-    eprintln!("  Admin API    : http://{addr}/api/*  (requires ADMIN_SECRET)");
+    eprintln!("  MCP endpoint : http://{addr}/mcp            (requires user API key)");
+    eprintln!("  Admin API    : http://{addr}/api/*           (requires ADMIN_SECRET)");
+    eprintln!("  Live view    : http://{addr}/view/<user_id>  (requires ADMIN_SECRET)");
     eprintln!("  Profiles dir : {}", server::profiles_base_dir().display());
     eprintln!("  DB           : {}", std::env::var("BROWSER_USE_DB_PATH")
         .unwrap_or_else(|_| "~/.browser-use/mcp-users.db".to_string()));
@@ -160,4 +165,8 @@ fn print_usage() {
     eprintln!("MCP client config (requires user API key from POST /api/users):");
     eprintln!("  {{ \"url\": \"http://<host>:<port>/mcp\",");
     eprintln!("    \"headers\": {{ \"Authorization\": \"Bearer buak_...\" }} }}");
+    eprintln!();
+    eprintln!("Live browser view (requires ADMIN_SECRET):");
+    eprintln!("  http://<host>:<port>/view/<user_id>?key=<ADMIN_SECRET>");
+    eprintln!("  (or via cloudflared: cloudflared tunnel --url http://localhost:<port>)");
 }

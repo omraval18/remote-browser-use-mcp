@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -50,7 +50,11 @@ fn resolve_bearer(state: &AppState, req: &Request) -> Option<String> {
 }
 
 pub fn bearer_token(req: &Request) -> Option<&str> {
-    req.headers()
+    bearer_from_headers(req.headers())
+}
+
+pub fn bearer_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("authorization")?
         .to_str()
         .ok()?
