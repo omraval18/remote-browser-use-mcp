@@ -108,19 +108,50 @@ async fn run_browser_screencast(tx: &broadcast::Sender<Arc<Vec<u8>>>) -> anyhow:
 }
 
 /// GET /json → page-level WebSocket URL for the first open page tab.
+/// Parses Content-Length to avoid hanging on read_to_end (Chrome keeps connection open).
 async fn cdp_page_ws_url(port: u16) -> anyhow::Result<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
-    let mut s = TcpStream::connect(("localhost", port)).await?;
-    s.write_all(
-        format!("GET /json HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
-    ).await?;
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await?;
-    let body = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-        .ok_or_else(|| anyhow::anyhow!("no HTTP body from /json"))?;
-    let tabs: Vec<serde_json::Value> = serde_json::from_slice(&buf[body..])?;
+
+    let stream = TcpStream::connect(("localhost", port)).await?;
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(
+            format!("GET /json HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut content_length: Option<usize> = None;
+
+    // Read headers line by line
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:") {
+            content_length = lower
+                .split_once(':')
+                .and_then(|(_, v)| v.trim().parse().ok());
+        }
+    }
+
+    // Read exactly Content-Length bytes (avoids hanging on kept-alive connections)
+    let body = if let Some(len) = content_length {
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
+        buf
+    } else {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        buf
+    };
+
+    let tabs: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
     tabs.iter()
         .find(|t| t["type"] == "page")
         .and_then(|t| t["webSocketDebuggerUrl"].as_str())
