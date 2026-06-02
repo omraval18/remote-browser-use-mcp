@@ -265,6 +265,41 @@ curl -X POST https://your-server.com/api/users/alice/rotate-key \
 
 In HTTP mode, Chrome connects to the user's profile automatically on first tool call — no manual `connect` needed.
 
+### Live Browser View
+
+Watch what any user's AI is doing in Chrome in real time — ~1 fps JPEG stream served over SSE, viewable in any browser.
+
+| Route | Description |
+|---|---|
+| `GET /view/{user_id}` | HTML viewer page with live frames, FPS counter, and session info |
+| `GET /stream/{user_id}` | Raw SSE stream of base64 JPEG frames (consumed by the viewer) |
+
+Both routes require `ADMIN_SECRET`. Pass it as a Bearer header or via `?key=` query param:
+
+```
+https://your-server.com/view/alice?key=your-strong-secret
+```
+
+**Exposing via cloudflared (no port-forwarding needed)**
+
+```bash
+# Install cloudflared once
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+
+# Start the MCP server
+ADMIN_SECRET=your-strong-secret browser-use-mcp --http --port 3000
+
+# In a second terminal — creates a public HTTPS tunnel instantly (no account needed)
+cloudflared tunnel --url http://localhost:3000
+# → https://some-name.trycloudflare.com
+
+# Open in your browser
+# https://some-name.trycloudflare.com/view/alice?key=your-strong-secret
+```
+
+The `?key=` param is required when opening the viewer in a browser because `EventSource` cannot send custom headers.
+
 ### How profiles work
 
 Each user gets their own Chrome `--user-data-dir`:
